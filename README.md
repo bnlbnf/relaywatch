@@ -1,5 +1,7 @@
 # RelayWatch
 
+[简体中文](README.md) | [繁體中文](README.zh_TW.md) | [English](README.en.md) | [日本語](README.ja.md) | [Français](README.fr.md)
+
 NewAPI/Sub2API 中转站采集、AI 模型比价、公告监测与接口状态看板。
 
 RelayWatch 是一个面向 AI API 中转站生态的聚合监控平台，用来把分散的中转站信息整理成可搜索、可比较、可追踪的目录。它支持全网站点发现、NewAPI/Sub2API 站点采集、模型价格对比、公告流、官方 API 状态、AI 热点资讯、在线对话和接口可用性检测。
