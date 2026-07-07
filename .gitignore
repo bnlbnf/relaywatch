@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Runtime logs and process files
+*.log
+*.err.log
+*.out.log
+*.pid
+
+# Generated data and local caches
+data/*.json
+data/*.jsonl
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.csv
+data/*.xlsx
+!data/.gitkeep
+
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/
+static/assets/
+static/index.html
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
