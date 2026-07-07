@@ -1,6 +1,4 @@
 <div align="center">
-  <img src="static/favicon.svg" width="88" alt="RelayWatch Logo" />
-
   <h1>RelayWatch</h1>
 
   <p><strong>NewAPI / Sub2API 中转站采集、模型比价、公告监测与 AI API 状态看板</strong></p>
