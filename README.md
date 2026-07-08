@@ -211,6 +211,10 @@ python load_json_to_db.py \
 
 如果你要公开自己的 fork，请先做密钥扫描，确认没有泄露私人数据。
 
+## 鸣谢
+
+感谢 [LINUX DO](https://linux.do/) 社区提供的交流氛围与开源推广支持。
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).

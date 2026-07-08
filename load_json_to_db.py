@@ -735,7 +735,7 @@ def main():
     parser.add_argument(
         "--keep-generations",
         type=int,
-        default=int(os.environ.get("RELAYWATCH_KEEP_GENERATIONS", "3")),
+        default=int(os.environ.get("RELAYWATCH_KEEP_GENERATIONS", "10")),
     )
     args = parser.parse_args()
     import_data(args)
