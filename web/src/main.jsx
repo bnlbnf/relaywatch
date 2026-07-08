@@ -472,6 +472,7 @@ function App() {
   const requestSeq = useRef(0);
   const dataRequestController = useRef(null);
   const currentPageSize = pageSizes[view] || PAGE_SIZE;
+  const visibleData = data._view === view ? data : { items: [], total: 0, pages: 1, page: 1, page_size: currentPageSize };
   const activeFilters = {
     ...filters,
     model: debouncedModelFilter,
@@ -582,7 +583,7 @@ function App() {
     dataRequestController.current?.abort();
     if (view === "about" || view === "detect" || view === "status" || view === "news" || view === "chat" || view === "tools") {
       setLoading(false);
-      setData({ items: [{ id: view }], total: 0, pages: 1, page: 1, page_size: currentPageSize });
+      setData({ _view: view, items: [{ id: view }], total: 0, pages: 1, page: 1, page_size: currentPageSize });
       return;
     }
     const controller = new AbortController();
@@ -615,20 +616,19 @@ function App() {
     request
       .then((nextData) => {
         if (requestId === requestSeq.current) {
-          setData(nextData);
+          setData({ ...nextData, _view: view });
         }
       })
       .catch((error) => {
         if (error.name === "AbortError") return;
         if (requestId === requestSeq.current) {
-          setData({ items: [], total: 0, pages: 1, page: 1, error: true, errorMessage: messageFromUnknown(error, "加载失败，请刷新重试") });
+          setData({ _view: view, items: [], total: 0, pages: 1, page: 1, error: true, errorMessage: messageFromUnknown(error, "加载失败，请刷新重试") });
         }
       })
       .finally(() => {
         if (requestId === requestSeq.current) {
           dataRequestController.current = null;
           setLoading(false);
-          refreshSummary();
         }
       });
   }
@@ -662,6 +662,7 @@ function App() {
 
   function refreshVisibleData() {
     loadData();
+    refreshSummary();
     api(view === "status" ? "/api/official-status" : "/api/official-status/summary", view === "status" ? { force: 1 } : {}).then(setOfficialStatus).catch(() => {});
     if (view === "news") api("/api/ai-news", { force: 1 }).then(setAiNews).catch(() => {});
   }
@@ -686,15 +687,15 @@ function App() {
         )}
         <section className="main">
           {view !== "news" && view !== "chat" && view !== "tools" && (
-            <Toolbar view={view} layout={layout} setLayout={setLayout} data={data} loading={loading} sortHint={view === "models" ? MODEL_SORT_HINTS[activeModelSort(filters.sort)] : null} />
+            <Toolbar view={view} layout={layout} setLayout={setLayout} data={visibleData} loading={loading} sortHint={view === "models" ? MODEL_SORT_HINTS[activeModelSort(filters.sort)] : null} />
           )}
-          <Content view={view} layout={layout} data={data} loading={loading} openSite={openSite} openPriceDrawer={setPriceDrawer} modelSort={activeModelSort(filters.sort)} filters={activeFilters} summary={summary} officialStatus={officialStatus} aiNews={aiNews} newsQuery={debouncedQuery} reloadAiNews={() => api("/api/ai-news", { force: 1 }).then(setAiNews)} aiNewsCategory={aiNewsCategory} setAiNewsCategory={setAiNewsCategory} officialProviderId={officialProviderId} setOfficialProviderId={setOfficialProviderId} reloadOfficialStatus={() => api("/api/official-status", { force: 1 }).then(setOfficialStatus)} />
+          <Content view={view} layout={layout} data={visibleData} loading={loading} openSite={openSite} openPriceDrawer={setPriceDrawer} modelSort={activeModelSort(filters.sort)} filters={activeFilters} summary={summary} officialStatus={officialStatus} aiNews={aiNews} newsQuery={debouncedQuery} reloadAiNews={() => api("/api/ai-news", { force: 1 }).then(setAiNews)} aiNewsCategory={aiNewsCategory} setAiNewsCategory={setAiNewsCategory} officialProviderId={officialProviderId} setOfficialProviderId={setOfficialProviderId} reloadOfficialStatus={() => api("/api/official-status", { force: 1 }).then(setOfficialStatus)} />
           {view !== "about" && view !== "detect" && view !== "status" && view !== "news" && view !== "chat" && view !== "tools" && (
             <Pager
-              page={data.page || page}
-              pages={data.pages || 1}
-              pageSize={data.page_size || currentPageSize}
-              total={data.total || 0}
+              page={visibleData.page || page}
+              pages={visibleData.pages || 1}
+              pageSize={visibleData.page_size || currentPageSize}
+              total={visibleData.total || 0}
               setPage={setPage}
               setPageSize={(nextSize) => setPageSizes((current) => ({ ...current, [view]: nextSize }))}
             />
