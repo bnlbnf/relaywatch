@@ -227,8 +227,8 @@ a { color: inherit; }
   gap: 11px;
   align-items: center;
   padding: 10px 0 14px;
-  border-top: 1px solid rgba(228, 231, 236, .65);
-  border-bottom: 1px solid rgba(228, 231, 236, .65);
+  border: 1px solid rgba(228, 231, 236, .9);
+  border-radius: 8px;
   background: rgba(255, 255, 255, .58);
 }
 .sponsor-copy {
