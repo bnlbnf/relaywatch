@@ -1269,13 +1269,13 @@ function ToolsPage({ initialTool = "detect" }) {
           <p>把在线对话和模型检测放到同一个工作台里，先试接口，再做检测。</p>
         </div>
         <div className="tools-tabs" aria-label="站点工具切换">
-          <button type="button" className={activeTool === "chat" ? "active" : ""} onClick={() => setActiveTool("chat")}>
-            <MessageSquare size={16} />
-            在线对话
-          </button>
           <button type="button" className={activeTool === "detect" ? "active" : ""} onClick={() => setActiveTool("detect")}>
             <TestTubeDiagonal size={16} />
             模型检测
+          </button>
+          <button type="button" className={activeTool === "chat" ? "active" : ""} onClick={() => setActiveTool("chat")}>
+            <MessageSquare size={16} />
+            在线对话
           </button>
         </div>
       </div>
