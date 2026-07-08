@@ -4353,6 +4353,8 @@ def quality_risk_tags(rows, response_model, requested_model):
         tags.append("高度疑似 Kiro 包装" if strong_kiro else "疑似 Agent/IDE 包装")
     has_specific_wrapper_tag = any("Kiro 包装" in tag or "Agent/IDE 包装" in tag for tag in tags)
     for row in rows:
+        if row.get("status") not in {"warn", "fail"}:
+            continue
         combined_text = " ".join([
             str(row.get("summary") or ""),
             str(row.get("sample") or ""),
@@ -4471,6 +4473,14 @@ def deterministic_ai_summary(score, tags, rows, response_model=None, requested_m
         return f"{identity}本次质量实测风险偏高，问题主要出现在" + "、".join(failed[:3]) + "。协议可用只说明接口能连通，不代表模型质量稳定；建议不要直接用于重要任务。"
     detail = f"{passed_text}，" if passed_text else ""
     return f"{identity}本次质量实测结果一般，{detail}基础调用可以完成，但稳定性、指令跟随和输出可信度还需要更多样本确认。"
+
+
+def quality_summary_mentions_unsupported_wrapper(summary, tags):
+    text = str(summary or "")
+    if not re.search(r"(?i)\bkiro\b|Agent|包装|隐藏上下文", text):
+        return False
+    wrapper_tags = [tag for tag in tags if "Kiro" in tag or "Agent" in tag or "包装" in tag or "隐藏上下文" in tag]
+    return not wrapper_tags
 
 
 def quality_level(score):
@@ -4728,10 +4738,12 @@ async def run_quality_probes(context):
             summary_result = await native_probe(client, base_url, api_key, model, summary_prompt, 180)
             summary_text = clean_quality_summary_text(compact_text(summary_result.get("text") or "", 260))
             if summary_result.get("ok") and len(summary_text) >= 45:
-                ai_summary = summary_text.strip(" \n`")
-                identity_text = quality_model_identity_text(response_model, model)
-                if identity_text and model not in ai_summary and (not response_model or response_model not in ai_summary):
-                    ai_summary = identity_text + ai_summary
+                candidate_summary = summary_text.strip(" \n`")
+                if not quality_summary_mentions_unsupported_wrapper(candidate_summary, tags):
+                    ai_summary = candidate_summary
+                    identity_text = quality_model_identity_text(response_model, model)
+                    if identity_text and model not in ai_summary and (not response_model or response_model not in ai_summary):
+                        ai_summary = identity_text + ai_summary
         except Exception:
             pass
 
@@ -4794,6 +4806,28 @@ DETECTION_VALUE_LABELS = {
     "finish_reason_invalid": "finish_reason 不在官方枚举范围内",
     "stream_event_invalid": "流式事件格式不符合协议",
     "stream_done_missing": "流式响应缺少结束标记",
+}
+
+TOKEN_RESULT_NAMES = {"token_usage", "token_billing", "usage"}
+TOKEN_HARD_FAIL_REASONS = {
+    "usage_missing",
+    "usage_non_numeric",
+    "usage_negative",
+    "usage_total_mismatch",
+    "completion_over_cap",
+    "output_over_cap",
+    "openai_usage_field_missing",
+    "anthropic_usage_field_missing",
+    "gemini_usage_field_missing",
+}
+TOKEN_SOFT_REASONS = {
+    "count_tokens_unavailable",
+    "count_tokens_mismatch",
+    "stream_usage_missing",
+    "stream_usage_mismatch",
+    "prompt_delta_out_of_range",
+    "input_delta_out_of_range",
+    "reference_mismatch",
 }
 
 DETECTION_TEXT_TRANSLATIONS = (
@@ -5051,6 +5085,262 @@ def compact_detection_performance(performance):
     return normalized
 
 
+def token_usage_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def collect_token_usage_dicts(details):
+    usages = []
+    sub_checks = details.get("sub_checks") if isinstance(details, dict) else None
+    if isinstance(sub_checks, dict):
+        for check in sub_checks.values():
+            if not isinstance(check, dict):
+                continue
+            for key in ("short_usage", "long_usage", "non_stream_usage", "stream_usage"):
+                value = check.get(key)
+                if isinstance(value, dict) and value:
+                    usages.append(value)
+    for key in ("usage", "short_usage", "long_usage", "stream_usage"):
+        value = details.get(key) if isinstance(details, dict) else None
+        if isinstance(value, dict) and value:
+            usages.append(value)
+    unique = []
+    seen = set()
+    for usage in usages:
+        try:
+            marker = json.dumps(usage, sort_keys=True, ensure_ascii=False, default=str)
+        except TypeError:
+            marker = str(sorted(usage.items()))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(usage)
+    return unique
+
+
+def token_openai_arithmetic_issue(usage):
+    prompt = token_usage_int(usage.get("prompt_tokens"))
+    completion = token_usage_int(usage.get("completion_tokens"))
+    total = token_usage_int(usage.get("total_tokens"))
+    keys_present = any(key in usage for key in ("prompt_tokens", "completion_tokens", "total_tokens"))
+    if not keys_present:
+        return None
+    if prompt is None or completion is None or total is None:
+        return "usage_non_numeric"
+    if prompt < 0 or completion < 0 or total < 0:
+        return "usage_negative"
+    if total < prompt or total < completion:
+        return "usage_total_mismatch"
+    tolerance = max(1, int(max(total, 1) * 0.01))
+    if abs(total - prompt - completion) > tolerance:
+        return "usage_total_mismatch"
+    return None
+
+
+def token_anthropic_usage_issue(usage):
+    keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
+    nested_keys = ("cache_creation", "cache_read")
+    if not any(key in usage for key in keys + nested_keys):
+        return None
+    for key in keys:
+        if key not in usage:
+            continue
+        value = token_usage_int(usage.get(key))
+        if value is None:
+            return "usage_non_numeric"
+        if value < 0:
+            return "usage_negative"
+    for key in nested_keys:
+        value = usage.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            continue
+        for nested_value in value.values():
+            number = token_usage_int(nested_value)
+            if number is None:
+                return "usage_non_numeric"
+            if number < 0:
+                return "usage_negative"
+    return None
+
+
+def token_sub_check_passed(value):
+    if isinstance(value, dict):
+        return value.get("pass") is True
+    return value is True
+
+
+def token_delta_value(check):
+    if not isinstance(check, dict):
+        return None
+    return token_usage_int(check.get("delta"))
+
+
+def assess_token_detection_result(item, protocol=""):
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    sub_checks = details.get("sub_checks") if isinstance(details.get("sub_checks"), dict) else {}
+    usages = collect_token_usage_dicts(details)
+    hard_reasons = []
+    soft_reasons = []
+    passed_core = 0
+    total_core = 0
+
+    if not usages:
+        soft_reasons.append("usage_missing")
+    for usage in usages:
+        openai_issue = token_openai_arithmetic_issue(usage)
+        anthropic_issue = token_anthropic_usage_issue(usage)
+        if openai_issue:
+            hard_reasons.append(openai_issue)
+        if anthropic_issue:
+            hard_reasons.append(anthropic_issue)
+        if any(key in usage for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+            total_core += 1
+            if openai_issue is None:
+                passed_core += 1
+        if any(key in usage for key in ("input_tokens", "output_tokens")):
+            total_core += 1
+            if anthropic_issue is None:
+                passed_core += 1
+
+    usage_present = sub_checks.get("usage_present")
+    if usage_present is not None:
+        total_core += 1
+        if token_sub_check_passed(usage_present):
+            passed_core += 1
+        elif not usages:
+            soft_reasons.append("usage_missing")
+
+    for key in ("usage_arithmetic", "additive_usage"):
+        if key in sub_checks:
+            total_core += 1
+            if token_sub_check_passed(sub_checks.get(key)):
+                passed_core += 1
+            else:
+                hard_reasons.append("usage_total_mismatch")
+
+    for key in ("prompt_token_delta", "input_token_delta", "length_delta"):
+        if key not in sub_checks:
+            continue
+        delta = token_delta_value(sub_checks.get(key))
+        if token_sub_check_passed(sub_checks.get(key)):
+            passed_core += 1
+        elif delta is not None and delta > 0:
+            soft_reasons.append("prompt_delta_out_of_range")
+            passed_core += 1
+        else:
+            hard_reasons.append("prompt_delta_not_increasing")
+        total_core += 1
+
+    for key in ("completion_tokens", "output_tokens", "token_range"):
+        if key not in sub_checks:
+            continue
+        total_core += 1
+        check = sub_checks.get(key)
+        if token_sub_check_passed(check):
+            passed_core += 1
+            continue
+        if isinstance(check, dict):
+            max_tokens = token_usage_int(check.get("max_tokens"))
+            values = [
+                token_usage_int(check.get(candidate))
+                for candidate in (
+                    "short_completion_tokens",
+                    "long_completion_tokens",
+                    "short_output_tokens",
+                    "long_output_tokens",
+                    "output_tokens",
+                    "completion_tokens",
+                )
+            ]
+            values = [value for value in values if value is not None]
+            if any(value < 0 for value in values):
+                hard_reasons.append("usage_negative")
+            elif max_tokens is not None and any(value > max_tokens + max(16, int(max_tokens * 0.5)) for value in values):
+                hard_reasons.append("output_over_cap")
+            else:
+                soft_reasons.append("output_tokens_uncertain")
+        else:
+            soft_reasons.append("output_tokens_uncertain")
+
+    if "stream_usage" in sub_checks:
+        check = sub_checks.get("stream_usage")
+        if token_sub_check_passed(check):
+            passed_core += 1
+        else:
+            soft_reasons.append("stream_usage_missing" if not isinstance(check, dict) or not (check.get("stream_usage") or check.get("stream_input_tokens") is not None) else "stream_usage_mismatch")
+        total_core += 1
+
+    if "count_tokens" in sub_checks:
+        check = sub_checks.get("count_tokens")
+        if token_sub_check_passed(check):
+            passed_core += 1
+        else:
+            soft_reasons.append("count_tokens_unavailable" if isinstance(check, dict) and check.get("count_error") else "count_tokens_mismatch")
+        total_core += 1
+
+    if "normal_usage" in sub_checks:
+        check = sub_checks.get("normal_usage")
+        if isinstance(check, dict) and check.get("comparison_available"):
+            if token_sub_check_passed(check):
+                passed_core += 1
+            else:
+                soft_reasons.append("reference_mismatch")
+            total_core += 1
+
+    hard_reasons = list(dict.fromkeys(hard_reasons))
+    soft_reasons = list(dict.fromkeys(soft_reasons))
+    hard_reasons = [reason for reason in hard_reasons if reason in TOKEN_HARD_FAIL_REASONS or reason == "prompt_delta_not_increasing"]
+    reliability = round((passed_core / total_core * 100.0) if total_core else 0.0, 1)
+    if soft_reasons:
+        reliability = min(reliability, 85.0)
+    if any(reason in soft_reasons for reason in ("prompt_delta_out_of_range", "input_delta_out_of_range", "reference_mismatch")):
+        reliability = min(reliability, 75.0)
+    if hard_reasons:
+        status = "fail"
+        summary = "Token 计费存在硬性异常：用量字段缺失/非法、总数加法不一致，或长输入没有带来 token 增量，需要谨慎处理。"
+    elif not usages:
+        status = "warn"
+        summary = "接口没有返回可核验的 usage/token 字段，无法准确判断计费统计；这不代表模型不可用，但计费透明度不足。"
+    elif soft_reasons:
+        status = "warn"
+        if any(reason in soft_reasons for reason in ("prompt_delta_out_of_range", "input_delta_out_of_range")):
+            summary = (
+                "核心 usage 字段自洽，未发现字段造假；但长短 prompt 的 token 增量超出正常 tokenizer 范围，"
+                f"可能存在隐藏提示/包装上下文导致实际计费偏高，计费可信度约 {reliability:g}%。"
+            )
+        else:
+            summary = (
+                "核心 usage 字段自洽，未发现明显多算/少算；但流式统计、count_tokens 或参考范围存在口径差异，"
+                f"计费可信度约 {reliability:g}%。"
+            )
+    else:
+        status = "pass"
+        summary = f"Token 计费统计通过：usage 字段完整、非负且加法自洽，长短 prompt 增量和输出 token 均在合理范围，可信度约 {reliability:g}%。"
+
+    details["token_assessment"] = {
+        "status": status,
+        "reliability": reliability,
+        "hard_reasons": hard_reasons,
+        "soft_reasons": soft_reasons,
+        "usage_samples": usages[:3],
+        "note": "硬性异常才判失败；count_tokens 不支持、流式 usage 缺失或 tokenizer 差异只降低可信度。",
+    }
+    return status, summary, details
+
+
 def compact_detection_result(report):
     if not isinstance(report, dict):
         return None
@@ -5061,13 +5351,16 @@ def compact_detection_result(report):
         item_details = item.get("details") if isinstance(item.get("details"), dict) else {}
         item_status = item.get("status")
         item_summary = detection_detail_summary(item)
-        if item.get("name") == "identity" and item_details.get("detected_non_anthropic_brands"):
+        item_name = item.get("name")
+        if item_name in TOKEN_RESULT_NAMES and str(item_status or "").lower() not in {"skip", "skipped"}:
+            item_status, item_summary, item_details = assess_token_detection_result(item, report.get("protocol") or "")
+        if item_name == "identity" and item_details.get("detected_non_anthropic_brands"):
             item_status = "warn"
             brands = "、".join(short_detection_text(brand, 40) for brand in item_details.get("detected_non_anthropic_brands") if brand)
             item_summary = f"模型可调用，但身份自述暴露 {brands}，属于包装/Agent 风险，不等于接口不可用。"
         results.append(
             {
-                "name": item.get("name"),
+                "name": item_name,
                 "display_name": item.get("display_name") or item.get("displayName"),
                 "status": item_status,
                 "score": item.get("score"),

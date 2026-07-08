@@ -3446,6 +3446,7 @@ function DetectionResult({ result }) {
     const tone = detectionStatusMeta(item.status, item.name).tone;
     return tone === "warn" || tone === "fail";
   });
+  const hasFatalProtocolIssue = flagged.some((item) => detectionStatusMeta(item.status, item.name).tone === "fail");
   const reportSummary = result.summary && result.summary !== quality?.ai_summary && !(flagged.length && /^[\s]*(优秀|良好|通过|合格|正常)[\s。.!！]*$/i.test(String(result.summary)))
     ? result.summary
     : "";
@@ -3497,7 +3498,7 @@ function DetectionResult({ result }) {
         </div>
 
         {(reportSummary || result.run_error || flagged.length > 0) && (
-          <div className={`detect-report-note ${flagged.some((item) => detectionStatusMeta(item.status, item.name).tone === "fail") ? "fail" : "warn"}`}>
+          <div className={`detect-report-note ${hasFatalProtocolIssue ? "fail" : "warn"}`}>
             <strong>{flagged.length ? "协议检测摘要" : "协议检测说明"}</strong>
             {result.run_error && <p>{result.run_error}</p>}
             {reportSummary && <p>{reportSummary}</p>}
