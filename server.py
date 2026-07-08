@@ -3854,6 +3854,18 @@ def normalize_submitted_origin(value):
     return f"{parsed.scheme.lower()}://{host}".rstrip("/")
 
 
+def origin_from_submitted_url(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not re.match(r"^https?://", text, re.I):
+        text = "https://" + text
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc}".rstrip("/")
+
+
 def append_custom_origin(origin):
     path = CUSTOM_ORIGINS_PATH
     with SUBMITTED_ORIGINS_LOCK:
@@ -4339,12 +4351,13 @@ def quality_risk_tags(rows, response_model, requested_model):
             for row in wrapper_rows
         )
         tags.append("高度疑似 Kiro 包装" if strong_kiro else "疑似 Agent/IDE 包装")
+    has_specific_wrapper_tag = any("Kiro 包装" in tag or "Agent/IDE 包装" in tag for tag in tags)
     for row in rows:
         combined_text = " ".join([
             str(row.get("summary") or ""),
             str(row.get("sample") or ""),
         ])
-        if re.search(r"(?i)\b(kiro|agent|claude code|codex)\b", combined_text):
+        if not has_specific_wrapper_tag and re.search(r"(?i)\b(kiro|agent|claude code|codex)\b", combined_text):
             tags.append("疑似 Kiro/Agent 包装")
             break
     if response_model and requested_model:
@@ -4432,19 +4445,28 @@ def deterministic_ai_summary(score, tags, rows, response_model=None, requested_m
     passed_text = quality_passed_checks_text(rows)
     identity = quality_model_identity_text(response_model, requested_model)
     wrapper_tags = [tag for tag in tags if "Kiro" in tag or "Agent" in tag or "包装" in tag or "隐藏上下文" in tag]
-    wrapper_text = "；包装识别风险为" + "、".join(wrapper_tags[:2]) if wrapper_tags else ""
+    functional_tags = [tag for tag in tags if tag not in wrapper_tags and tag != "模型自述可信度低"]
+    wrapper_text = ""
+    if wrapper_tags:
+        wrapper_text = "包装识别显示" + "、".join(wrapper_tags[:2]) + "，不能当作纯官方裸模型看。"
+    if not functional_tags and "模型自述可信度低" in tags and wrapper_tags:
+        functional_tags = []
+    elif "模型自述可信度低" in tags:
+        functional_tags.append("模型自述可信度低")
     if score is None:
         return f"{identity}协议检测已经完成，目标站点可以完成基础连接和响应结构验证。质量实测暂时没有拿到足够样本，不能直接判断模型水平；需要结合协议报告和后续多次实测再看。"
     if any("超时" in str(row.get("summary") or "") for row in rows):
         return f"{identity}协议检测已经通过，说明接口和模型基础链路可用。质量实测里出现请求超时，主要风险在响应速度和稳定性；不建议直接承担重要任务。"
     if score >= 85:
         detail = f"{passed_text}，" if passed_text else ""
-        risk = "未发现明显功能风险" if not tags else "主要风险为" + "、".join(tags[:2])
-        return f"{identity}本次实测得分 {score}，{detail}说明接口能完成最小真实请求、基础判断、推理、结构化输出和代码指令跟随；{risk}{wrapper_text}，整体可用性较好。"
+        risk = "未发现明显功能风险" if not functional_tags else "主要功能风险为" + "、".join(functional_tags[:2])
+        wrapper_sentence = wrapper_text if wrapper_text else "未发现明显包装风险。"
+        return f"{identity}本次实测得分 {score}，{detail}说明接口能完成最小真实请求、基础判断、推理、结构化输出和代码指令跟随；{risk}。{wrapper_sentence}"
     if score >= 70:
-        focus = "，主要风险集中在" + "、".join(tags[:2]) if tags else ""
         detail = f"{passed_text}，" if passed_text else ""
-        return f"{identity}本次质量实测整体可用，{detail}核心调用能力没有明显问题{focus}{wrapper_text}。它更适合作为备选或低风险任务线路。"
+        risk = "核心调用能力没有明显问题" if not functional_tags else "主要功能风险集中在" + "、".join(functional_tags[:2])
+        wrapper_sentence = wrapper_text if wrapper_text else "未发现明显包装风险。"
+        return f"{identity}本次质量实测整体可用，{detail}{risk}。{wrapper_sentence}"
     if failed:
         return f"{identity}本次质量实测风险偏高，问题主要出现在" + "、".join(failed[:3]) + "。协议可用只说明接口能连通，不代表模型质量稳定；建议不要直接用于重要任务。"
     detail = f"{passed_text}，" if passed_text else ""
@@ -4822,6 +4844,23 @@ def translate_detection_text(text):
     return value
 
 
+def fix_detection_mojibake(value):
+    if not isinstance(value, str) or not value:
+        return value
+    # Some detector fields arrive as UTF-8 text decoded as latin-1, e.g.
+    # "å å¯çº§éªè¯" instead of "加密级验证". Fix only when typical mojibake
+    # markers are present so normal English/model names are left untouched.
+    if not re.search(r"[ÃÂ�]|[\u0080-\u009f]|(?:å|æ|ç|è|é|ä|ã)", value):
+        return value
+    try:
+        fixed = value.encode("latin1").decode("utf-8")
+    except Exception:
+        return value
+    if fixed and sum(1 for char in fixed if "\u4e00" <= char <= "\u9fff") >= 1:
+        return fixed
+    return value
+
+
 def short_detection_text(value, max_length=180):
     if value is None:
         return ""
@@ -4844,6 +4883,7 @@ def short_detection_text(value, max_length=180):
     text = text.strip()
     if not text:
         return ""
+    text = fix_detection_mojibake(text)
     text = re.sub(r"\s+", " ", text)
     text = translate_detection_text(text)
     return text[: max_length - 1] + "…" if len(text) > max_length else text
@@ -5018,32 +5058,39 @@ def compact_detection_result(report):
     for item in report.get("results") or []:
         if not isinstance(item, dict):
             continue
+        item_details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        item_status = item.get("status")
+        item_summary = detection_detail_summary(item)
+        if item.get("name") == "identity" and item_details.get("detected_non_anthropic_brands"):
+            item_status = "warn"
+            brands = "、".join(short_detection_text(brand, 40) for brand in item_details.get("detected_non_anthropic_brands") if brand)
+            item_summary = f"模型可调用，但身份自述暴露 {brands}，属于包装/Agent 风险，不等于接口不可用。"
         results.append(
             {
                 "name": item.get("name"),
                 "display_name": item.get("display_name") or item.get("displayName"),
-                "status": item.get("status"),
+                "status": item_status,
                 "score": item.get("score"),
                 "weight": item.get("weight"),
-                "summary": detection_detail_summary(item),
+                "summary": item_summary,
                 "severity": item.get("severity"),
                 "duration_ms": item.get("duration_ms") or item.get("durationMs"),
-                "details": item.get("details") if isinstance(item.get("details"), dict) else {},
+                "details": item_details,
                 "error": item.get("error"),
             }
         )
     return {
         "protocol": report.get("protocol"),
         "tier": report.get("tier"),
-        "tier_title": report.get("tier_title"),
+        "tier_title": short_detection_text(report.get("tier_title"), 80),
         "base_url": report.get("base_url"),
         "target_model": report.get("target_model"),
         "mode": report.get("mode"),
         "timestamp": report.get("timestamp"),
         "total_score": report.get("total_score"),
-        "verdict": report.get("verdict"),
-        "summary": report.get("summary"),
-        "run_error": report.get("run_error"),
+        "verdict": short_detection_text(report.get("verdict"), 80),
+        "summary": short_detection_text(report.get("summary"), 220),
+        "run_error": short_detection_text(report.get("run_error"), 220),
         "performance": compact_detection_performance(report.get("performance")),
         "results": results,
     }
@@ -7922,7 +7969,10 @@ async def create_detection(request: Request):
     protocol = normalize_detection_protocol(payload.get("protocol"))
     mode = normalize_detection_mode(payload.get("mode"))
     model = normalize_detection_model(payload.get("model"))
-    origin = normalize_submitted_origin(payload.get("origin") or payload.get("site_origin") or "")
+    origin_raw = payload.get("origin") or payload.get("site_origin") or ""
+    if not str(origin_raw or "").strip():
+        origin_raw = origin_from_submitted_url(payload.get("base_url") or "")
+    origin = normalize_submitted_origin(origin_raw)
     base_url = normalize_detection_base_url(payload.get("base_url"), origin, protocol)
     api_key = normalize_detection_api_key(payload.get("api_key"))
     include_long_context = bool(payload.get("include_long_context"))
@@ -8043,7 +8093,10 @@ async def detection_quality(job_id: str, request: Request):
     protocol = normalize_detection_protocol(payload.get("protocol"))
     mode = normalize_detection_mode(payload.get("mode"))
     model = normalize_detection_model(payload.get("model"))
-    origin = normalize_submitted_origin(payload.get("origin") or payload.get("site_origin") or "")
+    origin_raw = payload.get("origin") or payload.get("site_origin") or ""
+    if not str(origin_raw or "").strip():
+        origin_raw = origin_from_submitted_url(payload.get("base_url") or "")
+    origin = normalize_submitted_origin(origin_raw)
     base_url = normalize_detection_base_url(payload.get("base_url"), origin, protocol)
     api_key = normalize_detection_api_key(payload.get("api_key"))
     try:

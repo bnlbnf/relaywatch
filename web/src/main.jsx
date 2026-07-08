@@ -2844,6 +2844,9 @@ function detectionStatusMeta(status = "", name = "") {
     return { label: "警告", tone: "warn", Icon: Gauge };
   }
   if (["fail", "failed", "error"].includes(value)) {
+    if (itemName === "identity") {
+      return { label: "包装风险", tone: "warn", Icon: Gauge };
+    }
     return { label: "未通过", tone: "fail", Icon: X };
   }
   if (["skip", "skipped"].includes(value)) {
@@ -2955,7 +2958,23 @@ function detectionItemName(itemOrName) {
 function detectionSummaryText(item) {
   const text = messageFromUnknown(item?.summary, "");
   if (!text || text === "null" || text === "undefined") return "";
+  if (item?.name === "identity" && item?.details?.detected_non_anthropic_brands?.length) {
+    return `模型可调用，但身份自述暴露 ${item.details.detected_non_anthropic_brands.join("、")}，属于包装/Agent 风险，不等于接口不可用。`;
+  }
   return text;
+}
+
+function protocolReportTitle(result) {
+  if (!result) return "协议检测";
+  const score = Number(result.total_score);
+  const verdict = String(result.verdict || "").toLowerCase();
+  const identityRow = (result.results || []).find((item) => item?.name === "identity");
+  const identityBrands = identityRow?.details?.detected_non_anthropic_brands || [];
+  if ((verdict === "passed" || score >= 70) && identityBrands.length) {
+    return `可调用，但疑似 ${identityBrands.join("、")} 包装`;
+  }
+  if (verdict === "passed" || score >= 70) return "接口可调用";
+  return result.tier_title || result.verdict || "协议检测";
 }
 
 function orderedDetectionRows(rows, protocol) {
@@ -3450,7 +3469,7 @@ function DetectionResult({ result }) {
               <strong>{scoreMeta.text}</strong>
               <span>{scoreMeta.label}</span>
             </div>
-            <p>{result.tier_title || result.verdict || "协议检测"}</p>
+            <p>{protocolReportTitle(result)}</p>
             {result.base_url && <em>{result.base_url}</em>}
           </div>
 
