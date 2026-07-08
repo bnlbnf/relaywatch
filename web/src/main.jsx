@@ -3169,7 +3169,7 @@ function DetectionPage() {
           if (needsQuality && qualityRequest?.api_key) {
             setMessage("协议检测完成，正在生成质量实测...");
             try {
-              const qualityPayload = await postApi(`/api/detections/${job.job_id}/quality`, qualityRequest, { timeoutMs: 180000 });
+              const qualityPayload = await postApi(`/api/detections/${job.job_id}/quality`, qualityRequest, { timeoutMs: 300000 });
               if (!cancelled && qualityPayload.quality) {
                 nextResult = {
                   ...nextResult,
@@ -3330,8 +3330,8 @@ function DetectionPage() {
                 {mode === "quick"
                   ? "只跑基础连通、模型回显和协议结构，消耗最少，适合先判断能不能用。"
                   : mode === "full"
-                    ? "会尽量跑完整协议项；Claude 会多测行为签名/PDF 等能力，OpenAI/Gemini 目前主要接近标准模式。"
-                    : "会跑基础连通、结构化输出、工具/函数调用、协议完整性、Token 统计和质量实测，日常推荐用这个。"}
+                    ? "会尽量跑完整协议项；Claude 会多测行为签名/PDF 等能力，并追加 Kiro/Agent 包装识别。"
+                    : "会跑基础连通、结构化输出、Token 统计、质量实测和 Kiro/Agent 包装识别，日常推荐用这个。"}
               </small>
             </label>
             <label className="detect-wide">
@@ -3522,7 +3522,7 @@ function DetectionResult({ result }) {
           <div className="detect-report-box-head">
             <div>
               <h4>质量检测报告</h4>
-              <p>用同一个 Key 真实调用模型，检查中文判断、基础推理、严格 JSON、代码输出和模型自述。</p>
+              <p>用同一个 Key 真实调用模型，检查中文判断、基础推理、严格 JSON、代码输出、模型自述和 Kiro/Agent 包装痕迹。</p>
             </div>
           </div>
 
