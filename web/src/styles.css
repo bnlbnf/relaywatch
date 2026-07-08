@@ -216,20 +216,20 @@ a { color: inherit; }
   color: var(--muted);
 }
 .sponsor-strip {
-  width: 100%;
-  border-top: 1px solid rgba(228, 231, 236, .65);
-  border-bottom: 1px solid rgba(228, 231, 236, .65);
-  background: rgba(255, 255, 255, .58);
-}
-.sponsor-inner {
   max-width: 1520px;
   min-width: 0;
+  margin: 0 auto;
+  padding: 0 28px;
+}
+.sponsor-inner {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 11px;
   align-items: center;
-  margin: 0 auto;
-  padding: 10px 28px 14px;
+  padding: 10px 0 14px;
+  border-top: 1px solid rgba(228, 231, 236, .65);
+  border-bottom: 1px solid rgba(228, 231, 236, .65);
+  background: rgba(255, 255, 255, .58);
 }
 .sponsor-copy {
   min-width: 0;
