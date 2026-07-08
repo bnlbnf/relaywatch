@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import json
 import re
@@ -62,6 +62,27 @@ REDIS_AVAILABLE = None
 REDIS_RETRY_AT = 0
 REDIS_RETRY_INTERVAL = float(os.environ.get("RELAYWATCH_REDIS_RETRY_INTERVAL", "60"))
 REDIS_LOCK = threading.RLock()
+ANTICRAWL_ENABLED = os.environ.get("RELAYWATCH_ANTICRAWL_ENABLED", "1") != "0"
+ANTICRAWL_PREFIX = f"{REDIS_PREFIX}:anticrawl"
+ANTICRAWL_TRUST_PROXY = os.environ.get("RELAYWATCH_ANTICRAWL_TRUST_PROXY", "0") == "1"
+ANTICRAWL_ALLOWLIST = {
+    item.strip()
+    for item in os.environ.get("RELAYWATCH_ANTICRAWL_ALLOWLIST", "127.0.0.1,::1").split(",")
+    if item.strip()
+}
+ANTICRAWL_PAGE_LIMITS = {
+    "/api/sites": int(os.environ.get("RELAYWATCH_ANTICRAWL_SITES_MAX_PAGE", "100")),
+    "/api/models": int(os.environ.get("RELAYWATCH_ANTICRAWL_MODELS_MAX_PAGE", "100")),
+    "/api/announcements": int(os.environ.get("RELAYWATCH_ANTICRAWL_ANNOUNCEMENTS_MAX_PAGE", "100")),
+    "/api/model-sites": int(os.environ.get("RELAYWATCH_ANTICRAWL_MODEL_SITES_MAX_PAGE", "20")),
+}
+ANTICRAWL_HONEYPOT_PATHS = {"/api/_crawler_trap", "/api/crawler-trap", "/api/honeypot"}
+ANTICRAWL_SHORT_WINDOW = int(os.environ.get("RELAYWATCH_ANTICRAWL_SHORT_WINDOW", "10"))
+ANTICRAWL_BAN_SECONDS = int(os.environ.get("RELAYWATCH_ANTICRAWL_BAN_SECONDS", "600"))
+ANTICRAWL_HONEYPOT_BAN_SECONDS = int(os.environ.get("RELAYWATCH_ANTICRAWL_HONEYPOT_BAN_SECONDS", "86400"))
+ANTICRAWL_RISK_BAN_SCORE = int(os.environ.get("RELAYWATCH_ANTICRAWL_RISK_BAN_SCORE", "180"))
+ANTICRAWL_MEMORY = {}
+ANTICRAWL_MEMORY_LOCK = threading.RLock()
 DETECTION_CONTEXTS = {}
 DETECTION_QUALITY_RESULTS = {}
 DETECTION_CONTEXTS_LOCK = threading.RLock()
@@ -3572,6 +3593,170 @@ def redis_cache_set(namespace, key, value, ttl):
         print(f"redis_cache_set_failed namespace={namespace} error={str(exc)[:160]}", flush=True)
 
 
+def anticrawl_ip_hash(value):
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:24]
+
+
+def anticrawl_client_ip(request):
+    if ANTICRAWL_TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for") or ""
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        real_ip = request.headers.get("x-real-ip") or ""
+        if real_ip:
+            return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
+def anticrawl_memory_get(key):
+    now = time.time()
+    with ANTICRAWL_MEMORY_LOCK:
+        item = ANTICRAWL_MEMORY.get(key)
+        if not item:
+            return None
+        value, expires_at = item
+        if expires_at and expires_at <= now:
+            ANTICRAWL_MEMORY.pop(key, None)
+            return None
+        return value
+
+
+def anticrawl_memory_set(key, value, ttl):
+    expires_at = time.time() + max(1, int(ttl)) if ttl else 0
+    with ANTICRAWL_MEMORY_LOCK:
+        ANTICRAWL_MEMORY[key] = (value, expires_at)
+        if len(ANTICRAWL_MEMORY) > 20000:
+            now = time.time()
+            for old_key, (_old_value, old_expires) in list(ANTICRAWL_MEMORY.items())[:5000]:
+                if old_expires and old_expires <= now:
+                    ANTICRAWL_MEMORY.pop(old_key, None)
+
+
+def anticrawl_memory_incr(key, amount, ttl):
+    now = time.time()
+    with ANTICRAWL_MEMORY_LOCK:
+        value, expires_at = ANTICRAWL_MEMORY.get(key, (0, 0))
+        if expires_at and expires_at <= now:
+            value = 0
+        value = int(value or 0) + int(amount)
+        ANTICRAWL_MEMORY[key] = (value, now + max(1, int(ttl)))
+        return value
+
+
+def anticrawl_get(key):
+    client = redis_client()
+    if client is not None:
+        try:
+            return client.get(f"{ANTICRAWL_PREFIX}:{key}")
+        except Exception as exc:
+            print(f"anticrawl_get_failed error={str(exc)[:120]}", flush=True)
+    return anticrawl_memory_get(key)
+
+
+def anticrawl_set(key, value, ttl):
+    client = redis_client()
+    if client is not None:
+        try:
+            client.setex(f"{ANTICRAWL_PREFIX}:{key}", max(1, int(ttl)), str(value))
+            return
+        except Exception as exc:
+            print(f"anticrawl_set_failed error={str(exc)[:120]}", flush=True)
+    anticrawl_memory_set(key, str(value), ttl)
+
+
+def anticrawl_incr(key, amount=1, ttl=60):
+    client = redis_client()
+    if client is not None:
+        try:
+            full_key = f"{ANTICRAWL_PREFIX}:{key}"
+            value = client.incrby(full_key, int(amount))
+            if value == int(amount):
+                client.expire(full_key, max(1, int(ttl)))
+            return value
+        except Exception as exc:
+            print(f"anticrawl_incr_failed error={str(exc)[:120]}", flush=True)
+    return anticrawl_memory_incr(key, amount, ttl)
+
+
+def anticrawl_is_banned(ip_key):
+    return anticrawl_get(f"ban:{ip_key}") is not None
+
+
+def anticrawl_ban(ip_key, seconds, reason):
+    anticrawl_set(f"ban:{ip_key}", reason or "blocked", seconds)
+
+
+def anticrawl_add_risk(ip_key, score, reason=""):
+    if score <= 0:
+        return 0
+    total = anticrawl_incr(f"risk:{ip_key}", score, 1800)
+    if total >= ANTICRAWL_RISK_BAN_SCORE:
+        anticrawl_ban(ip_key, ANTICRAWL_BAN_SECONDS, reason or "risk-score")
+    return total
+
+
+def anticrawl_route_policy(path, method="GET"):
+    method = (method or "GET").upper()
+    if path in {"/api/summary", "/api/official-status/summary", "/api/filters"}:
+        return {"name": "light", "limit": 180, "window": 60, "weight": 1, "burst": 80}
+    if path in {"/api/sites", "/api/models", "/api/announcements", "/api/ai-news", "/api/official-status"}:
+        return {"name": "medium", "limit": 90, "window": 60, "weight": 2, "burst": 45}
+    if path in {"/api/model-sites"} or path.startswith("/api/ai-news/articles/") or path.startswith("/api/sites/"):
+        return {"name": "heavy", "limit": 35, "window": 60, "weight": 4, "burst": 18}
+    if path.startswith("/api/detections/") and method == "GET":
+        return {"name": "detect-poll", "limit": 90, "window": 60, "weight": 1, "burst": 30}
+    if path in {"/api/chat/models"}:
+        return {"name": "heavy", "limit": 35, "window": 60, "weight": 4, "burst": 12}
+    if path in {"/api/chat/proxy", "/api/detections"} or (path.startswith("/api/detections/") and method == "POST"):
+        return {"name": "expensive", "limit": 24, "window": 60, "weight": 6, "burst": 8}
+    if path.startswith("/api/"):
+        return {"name": "api", "limit": 60, "window": 60, "weight": 2, "burst": 30}
+    return None
+
+
+def anticrawl_bad_client_score(request):
+    score = 0
+    ua = (request.headers.get("user-agent") or "").strip().lower()
+    accept = (request.headers.get("accept") or "").strip().lower()
+    if not ua:
+        score += 35
+    crawler_tokens = ("python-requests", "httpx", "aiohttp", "curl/", "wget", "scrapy", "go-http-client", "java/", "okhttp", "node-fetch", "axios")
+    if any(token in ua for token in crawler_tokens):
+        score += 20
+    if request.url.path.startswith("/api/") and accept and not any(token in accept for token in ("application/json", "text/event-stream", "*/*")):
+        score += 10
+    return score
+
+
+def anticrawl_fingerprint(request):
+    query = request.query_params
+    pieces = [
+        request.url.path,
+        query.get("q", ""),
+        query.get("provider", ""),
+        query.get("status", ""),
+        query.get("group", ""),
+        query.get("billing", ""),
+        query.get("tag", ""),
+        query.get("model", ""),
+        query.get("sort", ""),
+    ]
+    return hashlib.sha1("|".join(pieces).encode("utf-8")).hexdigest()[:16]
+
+
+def anticrawl_page_violation(request):
+    path = request.url.path
+    if path not in ANTICRAWL_PAGE_LIMITS:
+        return ""
+    try:
+        page = int(request.query_params.get("page") or "1")
+    except ValueError:
+        return "页码格式不正确"
+    if page > ANTICRAWL_PAGE_LIMITS[path]:
+        return "翻页过深，请使用搜索或筛选条件缩小范围"
+    return ""
+
+
 def model_result_cache_get(key):
     now = time.time()
     with DB_MODEL_RESULT_CACHE_LOCK:
@@ -3901,12 +4086,21 @@ QUALITY_PROBES = [
         "name": "self_report",
         "prompt": '只返回 JSON，不要解释：{"self_reported_model":"","capabilities":[],"risk_note":""}',
         "max_tokens": 64,
-        "weight": 0,
+        "weight": 1,
     },
 ]
 
 
-def quality_probe_status(name, text, response_model=None, requested_model=None, usage=None, error=None):
+def quality_probe_status(
+    name,
+    text,
+    response_model=None,
+    requested_model=None,
+    usage=None,
+    error=None,
+    finish_reason=None,
+    content_types=None,
+):
     if error:
         error_text = short_detection_text(error, 180)
         if "超时" in error_text:
@@ -3916,13 +4110,35 @@ def quality_probe_status(name, text, response_model=None, requested_model=None, 
     lowered = value.lower()
     if not value:
         return "fail", "返回内容为空"
+    finished_by_length = str(finish_reason or "").lower() in {"length", "max_tokens"}
+    leaked_thinking = bool(re.search(r"(?is)<\s*thinking\s*>|<\s*/\s*thinking\s*>", value))
+    native_thinking = "thinking" in {str(item).lower() for item in (content_types or [])}
     if name == "smoke":
+        if leaked_thinking:
+            return "warn", "最小请求夹带 thinking 内容"
         return ("pass", "最小请求成功") if re.fullmatch(r"(?is)\s*ok[.!。！]?\s*", value) else ("warn", f"返回了内容，但不是严格 OK：{short_detection_text(value, 80)}")
     if name == "cn_number":
-        if "9.9" in value and ("更大" in value or "大于" in value or ">" in value):
-            return "pass", "能正确比较 9.9 与 9.11"
-        if "9.11" in value and ("更大" in value or "大于" in value or ">" in value):
+        compact_value = re.sub(r"\s+", "", value)
+        correct_number = (
+            "9.9>9.11" in compact_value
+            or "9.11<9.9" in compact_value
+            or re.search(r"9\.9[^。！？\n]{0,18}(?:更大|大于)", value)
+        )
+        wrong_number = (
+            "9.11>9.9" in compact_value
+            or "9.9<9.11" in compact_value
+            or re.search(r"9\.11[^。！？\n]{0,18}(?:更大|大于)", value)
+        )
+        if wrong_number and not correct_number:
             return "fail", "简单数字比较答错"
+        if correct_number:
+            if finished_by_length:
+                return "warn", "数字判断正确，但输出被截断"
+            if len(value) > 80:
+                return "warn", "数字判断正确，但没有遵守短答要求"
+            if re.search(r"[A-Za-zぁ-ゟ゠-ヿ가-힣]", value):
+                return "warn", "数字判断正确，但混入非中文输出"
+            return "pass", "能正确比较 9.9 与 9.11"
         return "warn", "没有给出清晰中文结论"
     if name == "reasoning":
         if any(token in lowered for token in ("$0.05", "0.05", "5 cents", "five cents", "5美分")):
@@ -3933,7 +4149,7 @@ def quality_probe_status(name, text, response_model=None, requested_model=None, 
     if name == "json_follow":
         candidate = value.strip()
         if candidate.startswith("```"):
-            return "warn", "JSON 正确性受 Markdown 包裹影响"
+            return "fail", "严格 JSON 被 Markdown 包裹"
         try:
             parsed = json.loads(candidate)
         except Exception:
@@ -3941,19 +4157,26 @@ def quality_probe_status(name, text, response_model=None, requested_model=None, 
         return ("pass", "严格 JSON 输出正确") if parsed == {"ok": True, "n": 17} else ("fail", "JSON 内容不符合指定对象")
     if name == "code_only":
         bad_markdown = "```" in value
-        has_explain = any(token in value for token in ("解释", "说明", "这个函数", "Here's", "Here is"))
+        has_explain = any(token in value for token in ("解释", "说明", "这个函数", "Here's", "Here is", "测试", "示例", "复杂度", "算法"))
         has_function = "def is_valid_parentheses" in value and ("stack" in lowered or "append" in lowered)
         if has_function and not bad_markdown and not has_explain:
             return "pass", "能按要求只输出代码"
         if has_function:
-            return "warn", "代码存在，但没有严格遵守只输出代码"
+            return "fail", "代码存在，但没有严格遵守只输出代码"
         return "fail", "没有输出可识别的目标函数"
     if name == "self_report":
         try:
             parsed = json.loads(value)
             reported = short_detection_text(parsed.get("self_reported_model") or "", 80) if isinstance(parsed, dict) else ""
         except Exception:
+            if re.search(r"(?i)\b(kiro|agent|claude code|codex|repo|file|task)\b", value):
+                return "warn", "模型自述不是严格 JSON，且出现 Agent/Kiro 类包装痕迹"
             return "warn", "模型自述不是严格 JSON"
+        suspicious = re.search(r"(?i)\b(kiro|agent|claude code|codex|repo|file|task)\b", json.dumps(parsed, ensure_ascii=False) if isinstance(parsed, dict) else value)
+        if suspicious:
+            return "warn", "模型自述出现 Agent/Kiro 类包装痕迹"
+        if native_thinking:
+            return "warn", "原生响应包含 thinking 内容，仅作弱证据"
         if reported and requested_model and reported.lower() not in requested_model.lower() and requested_model.lower() not in reported.lower():
             return "warn", f"模型自述为 {reported}，只能作为弱证据"
         return "pass", "模型自述格式可解析，仅作弱证据"
@@ -3987,6 +4210,8 @@ def build_quality_row(probe, result, model):
         requested_model=model,
         usage=result.get("usage"),
         error=result.get("error"),
+        finish_reason=result.get("finish_reason"),
+        content_types=result.get("content_types"),
     )
     return {
         "name": probe["name"],
@@ -3997,6 +4222,8 @@ def build_quality_row(probe, result, model):
         "http_status": result.get("http_status"),
         "latency_ms": result.get("latency_ms"),
         "response_model": result.get("response_model"),
+        "finish_reason": result.get("finish_reason"),
+        "content_types": result.get("content_types") if isinstance(result.get("content_types"), list) else [],
         "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
         "sample": short_detection_text(result.get("text") or "", 240),
     }
@@ -4011,7 +4238,7 @@ def quality_score(rows):
         if row.get("status") == "pass":
             earned += weight
         elif row.get("status") == "warn":
-            earned += weight * 0.45
+            earned += weight * 0.25
     return round((earned / total) * 100) if total else None
 
 
@@ -4028,6 +4255,16 @@ def quality_risk_tags(rows, response_model, requested_model):
         tags.append("指令跟随不稳")
     if by_name.get("code_only", {}).get("status") in {"warn", "fail"}:
         tags.append("代码输出不够干净")
+    if by_name.get("self_report", {}).get("status") in {"warn", "fail"}:
+        tags.append("模型自述可信度低")
+    for row in rows:
+        combined_text = " ".join([
+            str(row.get("summary") or ""),
+            str(row.get("sample") or ""),
+        ])
+        if re.search(r"(?i)\b(kiro|agent|claude code|codex)\b", combined_text):
+            tags.append("疑似 Kiro/Agent 包装")
+            break
     if response_model and requested_model:
         left = str(response_model).lower()
         right = str(requested_model).lower()
@@ -4036,6 +4273,16 @@ def quality_risk_tags(rows, response_model, requested_model):
     for row in rows:
         if "超时" in str(row.get("summary") or ""):
             tags.append("响应超时或偏慢")
+            break
+    for row in rows:
+        if str(row.get("finish_reason") or "").lower() in {"length", "max_tokens"}:
+            tags.append("输出被截断")
+            break
+    for row in rows:
+        sample = str(row.get("sample") or "")
+        content_types = {str(item).lower() for item in (row.get("content_types") or [])}
+        if re.search(r"(?is)<\s*thinking\s*>|<\s*/\s*thinking\s*>", sample) or "thinking" in content_types:
+            tags.append("疑似思考内容泄露")
             break
     for row in rows:
         usage = row.get("usage") or {}
@@ -4080,26 +4327,41 @@ def clean_quality_summary_text(value):
     return text.strip(" ，,。.!！")
 
 
-def deterministic_ai_summary(score, tags, rows):
+def quality_model_identity_text(response_model, requested_model):
+    requested = short_detection_text(requested_model or "", 80)
+    response = short_detection_text(response_model or "", 80)
+    if requested and response:
+        if requested == response:
+            return f"请求模型和返回模型均为 {response}。"
+        return f"请求模型 {requested}，返回模型 {response}。"
+    if requested:
+        return f"请求模型 {requested}。"
+    if response:
+        return f"返回模型 {response}。"
+    return ""
+
+
+def deterministic_ai_summary(score, tags, rows, response_model=None, requested_model=None):
     failed = [QUALITY_PROBE_LABELS.get(row.get("name"), row.get("name")) for row in rows if row.get("status") == "fail"]
     warned = [QUALITY_PROBE_LABELS.get(row.get("name"), row.get("name")) for row in rows if row.get("status") == "warn"]
     passed_text = quality_passed_checks_text(rows)
+    identity = quality_model_identity_text(response_model, requested_model)
     if score is None:
-        return "协议检测已经完成，目标站点可以完成基础连接和响应结构验证。质量实测暂时没有拿到足够样本，不能直接判断模型水平；需要结合协议报告和后续多次实测再看。"
+        return f"{identity}协议检测已经完成，目标站点可以完成基础连接和响应结构验证。质量实测暂时没有拿到足够样本，不能直接判断模型水平；需要结合协议报告和后续多次实测再看。"
     if any("超时" in str(row.get("summary") or "") for row in rows):
-        return "协议检测已经通过，说明接口和模型基础链路可用。质量实测里出现请求超时，主要风险在响应速度和稳定性；不建议直接承担重要任务。"
+        return f"{identity}协议检测已经通过，说明接口和模型基础链路可用。质量实测里出现请求超时，主要风险在响应速度和稳定性；不建议直接承担重要任务。"
     if score >= 85:
         detail = f"{passed_text}，" if passed_text else ""
         risk = "未发现明显功能风险" if not tags else "主要风险为" + "、".join(tags[:2])
-        return f"本次实测得分 {score}，{detail}说明接口能完成最小真实请求、基础判断、推理、结构化输出和代码指令跟随；{risk}，整体可用性较好。"
+        return f"{identity}本次实测得分 {score}，{detail}说明接口能完成最小真实请求、基础判断、推理、结构化输出和代码指令跟随；{risk}，整体可用性较好。"
     if score >= 70:
         focus = "，主要风险集中在" + "、".join(tags[:2]) if tags else ""
         detail = f"{passed_text}，" if passed_text else ""
-        return f"本次质量实测整体可用，{detail}核心调用能力没有明显问题{focus}。它更适合作为备选或低风险任务线路。"
+        return f"{identity}本次质量实测整体可用，{detail}核心调用能力没有明显问题{focus}。它更适合作为备选或低风险任务线路。"
     if failed:
-        return "本次质量实测风险偏高，问题主要出现在" + "、".join(failed[:3]) + "。协议可用只说明接口能连通，不代表模型质量稳定；建议不要直接用于重要任务。"
+        return f"{identity}本次质量实测风险偏高，问题主要出现在" + "、".join(failed[:3]) + "。协议可用只说明接口能连通，不代表模型质量稳定；建议不要直接用于重要任务。"
     detail = f"{passed_text}，" if passed_text else ""
-    return f"本次质量实测结果一般，{detail}基础调用可以完成，但稳定性、指令跟随和输出可信度还需要更多样本确认。"
+    return f"{identity}本次质量实测结果一般，{detail}基础调用可以完成，但稳定性、指令跟随和输出可信度还需要更多样本确认。"
 
 
 def quality_level(score):
@@ -4126,7 +4388,7 @@ def finalize_quality_result(rows, response_model, model):
     else:
         score = quality_score(rows)
         tags = quality_risk_tags(rows, response_model, model)
-        ai_summary = deterministic_ai_summary(score, tags, rows)
+        ai_summary = deterministic_ai_summary(score, tags, rows, response_model, model)
     return score, tags, ai_summary
 
 
@@ -4200,8 +4462,14 @@ async def call_openai_quality_probe(client, base_url, api_key, model, prompt, ma
             "latency_ms": latency_ms,
             "response_model": payload.get("model") if isinstance(payload, dict) else None,
             "usage": payload.get("usage") if isinstance(payload, dict) else {},
+            "finish_reason": None,
+            "content_types": [],
             "text": "",
         }
+    choices = payload.get("choices") if isinstance(payload, dict) else []
+    finish_reason = None
+    if choices and isinstance(choices[0], dict):
+        finish_reason = choices[0].get("finish_reason")
     return {
         "ok": True,
         "error": "",
@@ -4209,6 +4477,8 @@ async def call_openai_quality_probe(client, base_url, api_key, model, prompt, ma
         "latency_ms": latency_ms,
         "response_model": payload.get("model") if isinstance(payload, dict) else None,
         "usage": payload.get("usage") if isinstance(payload, dict) else {},
+        "finish_reason": finish_reason,
+        "content_types": [],
         "text": chat_completion_text(payload),
     }
 
@@ -4251,12 +4521,17 @@ async def call_anthropic_quality_probe(client, base_url, api_key, model, prompt,
             "latency_ms": latency_ms,
             "response_model": payload.get("model") if isinstance(payload, dict) else None,
             "usage": normalized_usage,
+            "finish_reason": payload.get("stop_reason") if isinstance(payload, dict) else None,
+            "content_types": [],
             "text": "",
         }
     text_parts = []
+    content_types = []
     content_parts = payload.get("content") if isinstance(payload, dict) else []
     for part in content_parts or []:
         if isinstance(part, dict):
+            if part.get("type"):
+                content_types.append(part.get("type"))
             text_parts.append(part.get("text") or "")
     return {
         "ok": True,
@@ -4265,6 +4540,8 @@ async def call_anthropic_quality_probe(client, base_url, api_key, model, prompt,
         "latency_ms": latency_ms,
         "response_model": payload.get("model") if isinstance(payload, dict) else None,
         "usage": normalized_usage,
+        "finish_reason": payload.get("stop_reason") if isinstance(payload, dict) else None,
+        "content_types": content_types,
         "text": "".join(text_parts),
     }
 
@@ -4319,11 +4596,13 @@ async def run_quality_probes(context):
         passed_checks = quality_passed_checks_text(rows)
         summary_prompt = (
             "你是模型检测报告的总结员。请基于下面事实，用中文给用户总结本次模型实测结果。"
-            "要求：2到3句话，90到170个汉字；先说明得分，再说明实际检测了什么，最后说明主要风险。"
+            "要求：2到3句话，90到170个汉字；先说明请求模型和返回模型，再说明得分、实际检测了什么，最后说明主要风险。"
             "通过项请优先使用这些名称：真实调用、数字判断、基础推理、严格JSON、代码指令跟随。"
             "不要自称，不要营销，不要写“建议继续进行小额测试，观察稳定性与成本表现”或类似小额测试、扣费建议：\n"
             + json.dumps(
                 {
+                    "requested_model": model,
+                    "response_model": response_model,
                     "score": score,
                     "passed_checks": passed_checks,
                     "risk_tags": tags,
@@ -4338,6 +4617,9 @@ async def run_quality_probes(context):
             summary_text = clean_quality_summary_text(compact_text(summary_result.get("text") or "", 260))
             if summary_result.get("ok") and len(summary_text) >= 45:
                 ai_summary = summary_text.strip(" \n`")
+                identity_text = quality_model_identity_text(response_model, model)
+                if identity_text and model not in ai_summary and (not response_model or response_model not in ai_summary):
+                    ai_summary = identity_text + ai_summary
         except Exception:
             pass
 
@@ -4980,8 +5262,76 @@ async def no_cache_api(request, call_next):
     # cached /api/filters otherwise shows dropdown options that no longer exist
     # in the live data (e.g. a "Hunyuan" entry that returns 0 results).
     started = time.time()
-    response = await call_next(request)
     path = request.url.path
+    if ANTICRAWL_ENABLED:
+        client_ip = anticrawl_client_ip(request)
+        ip_key = anticrawl_ip_hash(client_ip)
+        is_allowlisted = client_ip in ANTICRAWL_ALLOWLIST
+        if not is_allowlisted:
+            if path in ANTICRAWL_HONEYPOT_PATHS:
+                anticrawl_ban(ip_key, ANTICRAWL_HONEYPOT_BAN_SECONDS, "honeypot")
+                return JSONResponse(
+                    {"detail": "Not found"},
+                    status_code=404,
+                    headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+                )
+            if anticrawl_is_banned(ip_key):
+                return JSONResponse(
+                    {"detail": "请求过于频繁，请稍后再试"},
+                    status_code=429,
+                    headers={"Retry-After": str(ANTICRAWL_BAN_SECONDS), "Cache-Control": "no-store"},
+                )
+
+            page_error = anticrawl_page_violation(request)
+            if page_error:
+                anticrawl_add_risk(ip_key, 50, "deep-page")
+                return JSONResponse({"detail": page_error}, status_code=429, headers={"Cache-Control": "no-store"})
+
+            policy = anticrawl_route_policy(path, request.method)
+            if policy:
+                now = int(time.time())
+                window = int(policy["window"])
+                bucket = now // window
+                burst_bucket = now // ANTICRAWL_SHORT_WINDOW
+                route_key = f"rl:{ip_key}:{policy['name']}:{bucket}"
+                burst_key = f"burst:{ip_key}:{policy['name']}:{burst_bucket}"
+                route_count = anticrawl_incr(route_key, int(policy["weight"]), window + 5)
+                burst_count = anticrawl_incr(burst_key, 1, ANTICRAWL_SHORT_WINDOW + 3)
+                if route_count > int(policy["limit"]) or burst_count > int(policy["burst"]):
+                    anticrawl_add_risk(ip_key, 35, f"rate:{policy['name']}")
+                    return JSONResponse(
+                        {"detail": "请求过于频繁，请稍后再试"},
+                        status_code=429,
+                        headers={
+                            "Retry-After": str(max(3, min(60, window - (now % window)))),
+                            "Cache-Control": "no-store",
+                            "X-RateLimit-Limit": str(policy["limit"]),
+                            "X-RateLimit-Used": str(route_count),
+                        },
+                    )
+
+                risk_score = anticrawl_bad_client_score(request)
+                if risk_score:
+                    anticrawl_add_risk(ip_key, risk_score, "client-fingerprint")
+                if path in ANTICRAWL_PAGE_LIMITS:
+                    try:
+                        page = int(request.query_params.get("page") or "1")
+                    except ValueError:
+                        page = 1
+                    fingerprint = anticrawl_fingerprint(request)
+                    last_key = f"pagewalk:{ip_key}:{fingerprint}"
+                    last_page_raw = anticrawl_get(last_key)
+                    try:
+                        last_page = int(last_page_raw or "0")
+                    except ValueError:
+                        last_page = 0
+                    if page >= 4 and last_page and page == last_page + 1:
+                        risk_total = anticrawl_add_risk(ip_key, 6, "sequential-page")
+                        if risk_total >= 90:
+                            await asyncio.sleep(0.7)
+                    anticrawl_set(last_key, page, 180)
+
+    response = await call_next(request)
     elapsed_ms = int((time.time() - started) * 1000)
     response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
     if path.startswith("/api/") and elapsed_ms >= 1000:
@@ -7631,6 +7981,19 @@ async def detection_quality(job_id: str, request: Request):
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt():
+    return "\n".join([
+        "User-agent: *",
+        "Disallow: /api/",
+        "Disallow: /data/",
+        "Crawl-delay: 10",
+        "",
+        "Sitemap: http://relaywatch.online/",
+        "",
+    ])
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

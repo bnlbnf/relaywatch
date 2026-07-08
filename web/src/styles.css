@@ -36,6 +36,15 @@ button { cursor: pointer; }
 a { color: inherit; }
 
 .app { min-height: 100vh; }
+.crawler-trap-link {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  clip-path: inset(50%);
+}
 .topbar {
   min-width: 0;
   position: sticky;

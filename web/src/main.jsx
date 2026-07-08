@@ -668,6 +668,7 @@ function App() {
 
   return (
     <div className="app">
+      <a className="crawler-trap-link" href="/api/_crawler_trap" tabIndex="-1" aria-hidden="true">crawler</a>
       <Topbar query={query} setQuery={setQuery} view={view} setView={setView} onSubmitSiteClick={jumpToSubmitSite} onRefresh={refreshVisibleData} loading={loading} />
       <Overview summary={summary} officialStatus={officialStatus} openOfficialStatus={openOfficialStatus} />
       <main className={`shell ${["chat", "tools"].includes(view) ? "chat-shell" : ""}`}>
