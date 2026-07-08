@@ -3863,6 +3863,9 @@ QUALITY_PROBE_LABELS = {
 }
 
 
+CORE_QUALITY_PROBE_NAMES = ("smoke", "cn_number", "reasoning", "json_follow", "code_only")
+
+
 QUALITY_PROBES = [
     {
         "name": "smoke",
@@ -4043,21 +4046,60 @@ def quality_risk_tags(rows, response_model, requested_model):
     return list(dict.fromkeys(tags))[:8]
 
 
+def quality_passed_checks_text(rows):
+    labels = []
+    by_name = {row.get("name"): row for row in rows}
+    display_names = {
+        "smoke": "真实调用",
+        "cn_number": "数字判断",
+        "reasoning": "基础推理",
+        "json_follow": "严格JSON",
+        "code_only": "代码指令跟随",
+    }
+    for name in CORE_QUALITY_PROBE_NAMES:
+        if by_name.get(name, {}).get("status") == "pass":
+            labels.append(display_names[name])
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return f"{labels[0]}通过"
+    return "、".join(labels[:-1]) + f"和{labels[-1]}均通过"
+
+
+def clean_quality_summary_text(value):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    blocked_patterns = [
+        r"建议继续进行小额测试[，,、 ]*观察稳定性与成本表现[。.!！]*",
+        r"建议继续小额测试[，,、 ]*观察稳定性与成本表现[。.!！]*",
+        r"建议.*?小额测试.*?(?:成本表现|扣费情况)[。.!！]*",
+    ]
+    for pattern in blocked_patterns:
+        text = re.sub(pattern, "", text, flags=re.I)
+    return text.strip(" ，,。.!！")
+
+
 def deterministic_ai_summary(score, tags, rows):
     failed = [QUALITY_PROBE_LABELS.get(row.get("name"), row.get("name")) for row in rows if row.get("status") == "fail"]
     warned = [QUALITY_PROBE_LABELS.get(row.get("name"), row.get("name")) for row in rows if row.get("status") == "warn"]
+    passed_text = quality_passed_checks_text(rows)
     if score is None:
-        return "协议检测已经完成，目标站点可以完成基础连接和响应结构验证。质量实测暂时没有拿到足够样本，不能直接判断模型水平；建议结合协议报告和后续多次实测，再决定是否继续使用。"
+        return "协议检测已经完成，目标站点可以完成基础连接和响应结构验证。质量实测暂时没有拿到足够样本，不能直接判断模型水平；需要结合协议报告和后续多次实测再看。"
     if any("超时" in str(row.get("summary") or "") for row in rows):
-        return "协议检测已经通过，说明接口和模型基础链路可用。质量实测里出现请求超时，主要风险在响应速度和稳定性；适合先小额继续观察，不建议直接承担重要任务。"
-    if score >= 85 and not tags:
-        return "本次质量实测表现较好，真实调用、中文判断、基础推理和指令跟随都比较稳定。按这次样本看，该模型可以作为候选线路继续小额使用，但仍建议观察多次检测结果和实际扣费。"
+        return "协议检测已经通过，说明接口和模型基础链路可用。质量实测里出现请求超时，主要风险在响应速度和稳定性；不建议直接承担重要任务。"
+    if score >= 85:
+        detail = f"{passed_text}，" if passed_text else ""
+        risk = "未发现明显功能风险" if not tags else "主要风险为" + "、".join(tags[:2])
+        return f"本次实测得分 {score}，{detail}说明接口能完成最小真实请求、基础判断、推理、结构化输出和代码指令跟随；{risk}，整体可用性较好。"
     if score >= 70:
         focus = "，主要风险集中在" + "、".join(tags[:2]) if tags else ""
-        return f"本次质量实测整体可用，核心调用能力没有明显问题{focus}。它更适合作为备选或低风险任务线路；正式长期使用前，建议继续看多次检测结果和实际扣费情况。"
+        detail = f"{passed_text}，" if passed_text else ""
+        return f"本次质量实测整体可用，{detail}核心调用能力没有明显问题{focus}。它更适合作为备选或低风险任务线路。"
     if failed:
         return "本次质量实测风险偏高，问题主要出现在" + "、".join(failed[:3]) + "。协议可用只说明接口能连通，不代表模型质量稳定；建议不要直接用于重要任务。"
-    return "本次质量实测结果一般，基础调用可以完成，但稳定性、指令跟随和输出可信度还需要更多样本确认。建议先小额试用，再决定是否长期使用。"
+    detail = f"{passed_text}，" if passed_text else ""
+    return f"本次质量实测结果一般，{detail}基础调用可以完成，但稳定性、指令跟随和输出可信度还需要更多样本确认。"
 
 
 def quality_level(score):
@@ -4080,7 +4122,7 @@ def finalize_quality_result(rows, response_model, model):
     if rows and all(quality_row_is_timeout(row) for row in rows):
         score = None
         tags = ["响应超时或偏慢"]
-        ai_summary = "协议检测已通过，说明接口入口和协议结构基本可用。质量实测阶段连续超时，没有拿到足够的模型行为样本；当前最大风险是响应速度和稳定性，建议稍后重测或只做小额验证。"
+        ai_summary = "协议检测已通过，说明接口入口和协议结构基本可用。质量实测阶段连续超时，没有拿到足够的模型行为样本；当前最大风险是响应速度和稳定性。"
     else:
         score = quality_score(rows)
         tags = quality_risk_tags(rows, response_model, model)
@@ -4274,15 +4316,26 @@ async def run_quality_probes(context):
                 break
 
         score, tags, fallback_summary = finalize_quality_result(rows, response_model, model)
+        passed_checks = quality_passed_checks_text(rows)
         summary_prompt = (
             "你是模型检测报告的总结员。请基于下面事实，用中文给用户总结本次模型实测结果。"
-            "要求：2到3句话，80到140个汉字；说明能不能用、主要风险、是否建议继续小额测试。不要自称，不要营销：\n"
-            + json.dumps({"score": score, "risk_tags": tags, "checks": [{k: row.get(k) for k in ("display_name", "status", "summary")} for row in rows]}, ensure_ascii=False)
+            "要求：2到3句话，90到170个汉字；先说明得分，再说明实际检测了什么，最后说明主要风险。"
+            "通过项请优先使用这些名称：真实调用、数字判断、基础推理、严格JSON、代码指令跟随。"
+            "不要自称，不要营销，不要写“建议继续进行小额测试，观察稳定性与成本表现”或类似小额测试、扣费建议：\n"
+            + json.dumps(
+                {
+                    "score": score,
+                    "passed_checks": passed_checks,
+                    "risk_tags": tags,
+                    "checks": [{k: row.get(k) for k in ("display_name", "status", "summary")} for row in rows],
+                },
+                ensure_ascii=False,
+            )
         )
         ai_summary = fallback_summary
         try:
             summary_result = await native_probe(client, base_url, api_key, model, summary_prompt, 180)
-            summary_text = compact_text(summary_result.get("text") or "", 260).strip()
+            summary_text = clean_quality_summary_text(compact_text(summary_result.get("text") or "", 260))
             if summary_result.get("ok") and len(summary_text) >= 45:
                 ai_summary = summary_text.strip(" \n`")
         except Exception:
