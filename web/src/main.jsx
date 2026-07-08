@@ -854,14 +854,16 @@ function Overview({ summary, officialStatus, openOfficialStatus }) {
 function RainyunAd() {
   return (
     <section className="sponsor-strip" aria-label="推广">
-      <div className="sponsor-copy">
-        <span>推广</span>
-        <strong>雨云首月 5 折</strong>
-        <p>注册即送优惠券，云服务器、云应用、游戏云、对象存储等产品可选，适合网站部署和轻量服务托管。</p>
+      <div className="sponsor-inner">
+        <div className="sponsor-copy">
+          <span>推广</span>
+          <strong>雨云首月 5 折</strong>
+          <p>注册即送优惠券，云服务器、云应用、游戏云、对象存储等产品可选，适合网站部署和轻量服务托管。</p>
+        </div>
+        <a className="sponsor-link" href="https://www.rainyun.com/rain666_" target="_blank" rel="noreferrer">
+          查看优惠 <ExternalLink size={14} />
+        </a>
       </div>
-      <a className="sponsor-link" href="https://www.rainyun.com/rain666_" target="_blank" rel="noreferrer">
-        查看优惠 <ExternalLink size={14} />
-      </a>
     </section>
   );
 }
