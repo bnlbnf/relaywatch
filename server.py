@@ -1090,6 +1090,7 @@ def build_uptime_rows(components, incidents=None, provider_indicator="none", day
         "window_days": days,
         "start_date": dates[0].isoformat(),
         "end_date": dates[-1].isoformat(),
+        "identity_meta": quality_identity_meta(rows, response_model, model),
         "rows": rows,
     }
 
@@ -4427,25 +4428,66 @@ def clean_quality_summary_text(value):
     return text.strip(" ，,。.!！")
 
 
-def quality_model_identity_text(response_model, requested_model):
-    requested = short_detection_text(requested_model or "", 80)
-    response = short_detection_text(response_model or "", 80)
-    if requested and response:
-        if requested == response:
-            return f"请求模型和返回模型均为 {response}。"
-        return f"请求模型 {requested}，返回模型 {response}。"
-    if requested:
-        return f"请求模型 {requested}。"
-    if response:
-        return f"返回模型 {response}。"
+
+def quality_self_report_text(rows):
+    for row in rows or []:
+        if row.get("name") != "self_report":
+            continue
+        sample = str(row.get("sample") or "").strip()
+        if not sample:
+            return ""
+        try:
+            parsed = json.loads(sample)
+        except Exception:
+            return short_detection_text(sample, 80)
+        if isinstance(parsed, dict):
+            reported = parsed.get("self_reported_model") or parsed.get("model") or parsed.get("name")
+            if reported:
+                return short_detection_text(reported, 80)
+        return short_detection_text(sample, 80)
     return ""
+
+
+def quality_identity_meta(rows, response_model, requested_model):
+    requested = short_detection_text(requested_model or "", 80)
+    api_model = short_detection_text(response_model or "", 80)
+    self_report = quality_self_report_text(rows)
+    api_same = bool(requested and api_model and requested.lower() == api_model.lower())
+    api_contains = bool(requested and api_model and (requested.lower() in api_model.lower() or api_model.lower() in requested.lower()))
+    return {
+        "requested_model": requested,
+        "api_response_model": api_model,
+        "self_reported_model": self_report,
+        "api_model_matches_request": api_same or api_contains,
+        "note": "\u63a5\u53e3\u56de\u4f20 model \u5b57\u6bb5\u53ea\u80fd\u8bf4\u660e\u4e2d\u8f6c\u63a5\u53e3\u58f0\u660e\u7684\u6a21\u578b\u540d\uff0c\u4e0d\u80fd\u5355\u72ec\u8bc1\u660e\u771f\u5b9e\u4e0a\u6e38\u7248\u672c\uff1b\u6a21\u578b\u81ea\u8ff0\u53ea\u4f5c\u5f31\u8bc1\u636e\u3002",
+    }
+
+
+def quality_model_identity_text(response_model, requested_model, rows=None):
+    meta = quality_identity_meta(rows or [], response_model, requested_model)
+    requested = meta.get("requested_model") or ""
+    api_model = meta.get("api_response_model") or ""
+    self_report = meta.get("self_reported_model") or ""
+    parts = []
+    if requested:
+        parts.append("\u8bf7\u6c42\u6a21\u578b\u4e3a " + requested)
+    if api_model:
+        if meta.get("api_model_matches_request"):
+            parts.append("\u63a5\u53e3\u56de\u4f20 model \u5b57\u6bb5\u4e5f\u58f0\u660e\u4e3a " + api_model)
+        else:
+            parts.append("\u63a5\u53e3\u56de\u4f20 model \u5b57\u6bb5\u4e3a " + api_model)
+    if self_report:
+        parts.append("\u6a21\u578b\u81ea\u8ff0\u4e3a " + self_report)
+    if not parts:
+        return ""
+    return "\uff1b".join(parts) + "\u3002\u6ce8\u610f\uff1a\u63a5\u53e3\u56de\u4f20\u548c\u6a21\u578b\u81ea\u8ff0\u90fd\u4e0d\u662f\u8bc1\u660e\u771f\u5b9e\u4e0a\u6e38\u7248\u672c\u7684\u5f3a\u8bc1\u636e\u3002"
 
 
 def deterministic_ai_summary(score, tags, rows, response_model=None, requested_model=None):
     failed = [QUALITY_PROBE_LABELS.get(row.get("name"), row.get("name")) for row in rows if row.get("status") == "fail"]
     warned = [QUALITY_PROBE_LABELS.get(row.get("name"), row.get("name")) for row in rows if row.get("status") == "warn"]
     passed_text = quality_passed_checks_text(rows)
-    identity = quality_model_identity_text(response_model, requested_model)
+    identity = quality_model_identity_text(response_model, requested_model, rows)
     wrapper_tags = [tag for tag in tags if "Kiro" in tag or "Agent" in tag or "包装" in tag or "隐藏上下文" in tag]
     functional_tags = [tag for tag in tags if tag not in wrapper_tags and tag != "模型自述可信度低"]
     wrapper_text = ""
@@ -4709,6 +4751,7 @@ async def run_quality_probes(context):
                     "requested_model": model,
                     "risk_tags": tags,
                     "ai_summary": ai_summary,
+                    "identity_meta": quality_identity_meta(rows, response_model, model),
                     "rows": rows,
                 }
             if probe["name"] == "smoke" and row["status"] == "fail":
@@ -4725,6 +4768,7 @@ async def run_quality_probes(context):
                 {
                     "requested_model": model,
                     "response_model": response_model,
+                    "identity_meta": quality_identity_meta(rows, response_model, model),
                     "score": score,
                     "passed_checks": passed_checks,
                     "risk_tags": tags,
@@ -4741,7 +4785,7 @@ async def run_quality_probes(context):
                 candidate_summary = summary_text.strip(" \n`")
                 if not quality_summary_mentions_unsupported_wrapper(candidate_summary, tags):
                     ai_summary = candidate_summary
-                    identity_text = quality_model_identity_text(response_model, model)
+                    identity_text = quality_model_identity_text(response_model, model, rows)
                     if identity_text and model not in ai_summary and (not response_model or response_model not in ai_summary):
                         ai_summary = identity_text + ai_summary
         except Exception:
@@ -4755,6 +4799,7 @@ async def run_quality_probes(context):
         "requested_model": model,
         "risk_tags": tags,
         "ai_summary": ai_summary,
+        "identity_meta": quality_identity_meta(rows, response_model, model),
         "rows": rows,
     }
 

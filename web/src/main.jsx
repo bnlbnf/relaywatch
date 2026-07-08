@@ -3442,6 +3442,7 @@ function DetectionResult({ result }) {
   const qualityReady = quality && !["pending", "skipped", "expired"].includes(quality.status);
   const qualityMeta = qualityScoreTone(qualityReady ? quality?.score : null);
   const qualityRows = (quality?.rows || []).filter((item) => item?.name !== "ai_summary");
+  const identityMeta = quality?.identity_meta || {};
   const flagged = rows.filter((item) => {
     const tone = detectionStatusMeta(item.status, item.name).tone;
     return tone === "warn" || tone === "fail";
@@ -3581,6 +3582,18 @@ function DetectionResult({ result }) {
               )}
             </div>
           </div>
+
+          {(identityMeta.requested_model || identityMeta.api_response_model || identityMeta.self_reported_model) && (
+            <div className="detect-identity-card">
+              <span>{"\u6a21\u578b\u8eab\u4efd\u58f0\u660e"}</span>
+              <div>
+                {identityMeta.requested_model && <p><b>{"\u8bf7\u6c42\u6a21\u578b"}</b><em>{identityMeta.requested_model}</em></p>}
+                {identityMeta.api_response_model && <p><b>{"\u63a5\u53e3\u56de\u4f20"}</b><em>{identityMeta.api_response_model}</em></p>}
+                {identityMeta.self_reported_model && <p><b>{"\u6a21\u578b\u81ea\u8ff0"}</b><em>{identityMeta.self_reported_model}</em></p>}
+              </div>
+              <small>{identityMeta.note || "\u63a5\u53e3\u56de\u4f20 model \u5b57\u6bb5\u548c\u6a21\u578b\u81ea\u8ff0\u90fd\u53ea\u80fd\u4f5c\u4e3a\u5f31\u8bc1\u636e\uff0c\u4e0d\u80fd\u5355\u72ec\u8bc1\u660e\u771f\u5b9e\u4e0a\u6e38\u7248\u672c\u3002"}</small>
+            </div>
+          )}
 
           {quality.ai_summary && (
             <div className="detect-ai-summary">
