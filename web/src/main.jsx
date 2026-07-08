@@ -1192,7 +1192,7 @@ function Toolbar({ view, layout, setLayout, data, loading, sortHint }) {
   const title = view === "sites" ? "可用中转站" : view === "models" ? "模型价格索引" : view === "detect" ? "模型检测" : view === "status" ? "官方 API 状态" : view === "news" ? "AI 热点资讯" : view === "announcements" ? "中转站公告" : "关于本站";
   const subtitle =
     view === "sites"
-      ? "筛选站点、模型、分组与价格信息"
+      ? "温馨提示：站点聚合页每 20 分钟随机展示一批在线站点。"
       : view === "models"
         ? "按模型横向比较各站点价格"
         : view === "detect"
