@@ -54,6 +54,14 @@ DB_SITE_RESULT_CACHE_TTL = float(os.environ.get("RELAYWATCH_SITE_RESULT_CACHE_TT
 DB_STATEMENT_TIMEOUT_MS = int(os.environ.get("RELAYWATCH_DB_STATEMENT_TIMEOUT_MS", "8000"))
 DB_META_CACHE = {}
 DB_META_CACHE_LOCK = threading.RLock()
+DB_META_CACHE_TTL = float(os.environ.get("RELAYWATCH_META_CACHE_TTL", "1800"))
+REDIS_URL = os.environ.get("REDIS_URL", "").strip() or os.environ.get("RELAYWATCH_REDIS_URL", "").strip()
+REDIS_PREFIX = os.environ.get("RELAYWATCH_REDIS_PREFIX", "relaywatch").strip() or "relaywatch"
+REDIS_CLIENT = None
+REDIS_AVAILABLE = None
+REDIS_RETRY_AT = 0
+REDIS_RETRY_INTERVAL = float(os.environ.get("RELAYWATCH_REDIS_RETRY_INTERVAL", "60"))
+REDIS_LOCK = threading.RLock()
 DETECTION_CONTEXTS = {}
 DETECTION_QUALITY_RESULTS = {}
 DETECTION_CONTEXTS_LOCK = threading.RLock()
@@ -3493,18 +3501,94 @@ def db_model_site_candidate_ids(cur, generation_id, q_lower):
     return {row["canonical_model_id"] for row in cur.fetchall()}
 
 
+def redis_cache_key(namespace, key):
+    try:
+        serialized = json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        serialized = repr(key)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"{REDIS_PREFIX}:{namespace}:{digest}"
+
+
+def redis_client():
+    global REDIS_CLIENT, REDIS_AVAILABLE, REDIS_RETRY_AT
+    if not REDIS_URL:
+        REDIS_AVAILABLE = False
+        return None
+    now = time.time()
+    if REDIS_AVAILABLE is False and now < REDIS_RETRY_AT:
+        return None
+    with REDIS_LOCK:
+        now = time.time()
+        if REDIS_AVAILABLE is False and now < REDIS_RETRY_AT:
+            return None
+        if REDIS_CLIENT is not None and REDIS_AVAILABLE:
+            return REDIS_CLIENT
+        try:
+            import redis
+            client = redis.Redis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=0.5,
+                socket_timeout=1.0,
+                retry_on_timeout=False,
+            )
+            client.ping()
+            REDIS_CLIENT = client
+            REDIS_AVAILABLE = True
+            REDIS_RETRY_AT = 0
+            print("redis_cache_enabled", flush=True)
+            return client
+        except Exception as exc:
+            REDIS_CLIENT = None
+            REDIS_AVAILABLE = False
+            REDIS_RETRY_AT = time.time() + REDIS_RETRY_INTERVAL
+            print(f"redis_cache_disabled error={str(exc)[:160]}", flush=True)
+            return None
+
+
+def redis_cache_get(namespace, key):
+    client = redis_client()
+    if client is None:
+        return None
+    try:
+        raw = client.get(redis_cache_key(namespace, key))
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception as exc:
+        print(f"redis_cache_get_failed namespace={namespace} error={str(exc)[:160]}", flush=True)
+        return None
+
+
+def redis_cache_set(namespace, key, value, ttl):
+    client = redis_client()
+    if client is None:
+        return
+    try:
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        client.setex(redis_cache_key(namespace, key), max(1, int(ttl)), raw)
+    except Exception as exc:
+        print(f"redis_cache_set_failed namespace={namespace} error={str(exc)[:160]}", flush=True)
+
+
 def model_result_cache_get(key):
     now = time.time()
     with DB_MODEL_RESULT_CACHE_LOCK:
         cached = DB_MODEL_RESULT_CACHE.get(key)
-        if not cached:
-            return None
-        timestamp, value = cached
-        if now - timestamp > DB_MODEL_RESULT_CACHE_TTL:
+        if cached:
+            timestamp, value = cached
+            if now - timestamp <= DB_MODEL_RESULT_CACHE_TTL:
+                DB_MODEL_RESULT_CACHE.move_to_end(key)
+                return value
             DB_MODEL_RESULT_CACHE.pop(key, None)
-            return None
-        DB_MODEL_RESULT_CACHE.move_to_end(key)
-        return value
+    cached = redis_cache_get("model-result", key)
+    if cached is not None:
+        with DB_MODEL_RESULT_CACHE_LOCK:
+            DB_MODEL_RESULT_CACHE[key] = (time.time(), cached)
+            DB_MODEL_RESULT_CACHE.move_to_end(key)
+        return cached
+    return None
 
 
 def model_result_cache_set(key, value):
@@ -3513,20 +3597,26 @@ def model_result_cache_set(key, value):
         DB_MODEL_RESULT_CACHE.move_to_end(key)
         while len(DB_MODEL_RESULT_CACHE) > DB_MODEL_RESULT_CACHE_MAX:
             DB_MODEL_RESULT_CACHE.popitem(last=False)
+    redis_cache_set("model-result", key, value, DB_MODEL_RESULT_CACHE_TTL)
 
 
 def site_result_cache_get(key):
     now = time.time()
     with DB_SITE_RESULT_CACHE_LOCK:
         cached = DB_SITE_RESULT_CACHE.get(key)
-        if not cached:
-            return None
-        timestamp, value = cached
-        if now - timestamp > DB_SITE_RESULT_CACHE_TTL:
+        if cached:
+            timestamp, value = cached
+            if now - timestamp <= DB_SITE_RESULT_CACHE_TTL:
+                DB_SITE_RESULT_CACHE.move_to_end(key)
+                return value
             DB_SITE_RESULT_CACHE.pop(key, None)
-            return None
-        DB_SITE_RESULT_CACHE.move_to_end(key)
-        return value
+    cached = redis_cache_get("site-result", key)
+    if cached is not None:
+        with DB_SITE_RESULT_CACHE_LOCK:
+            DB_SITE_RESULT_CACHE[key] = (time.time(), cached)
+            DB_SITE_RESULT_CACHE.move_to_end(key)
+        return cached
+    return None
 
 
 def site_result_cache_set(key, value):
@@ -3535,11 +3625,15 @@ def site_result_cache_set(key, value):
         DB_SITE_RESULT_CACHE.move_to_end(key)
         while len(DB_SITE_RESULT_CACHE) > DB_SITE_RESULT_CACHE_MAX:
             DB_SITE_RESULT_CACHE.popitem(last=False)
+    redis_cache_set("site-result", key, value, DB_SITE_RESULT_CACHE_TTL)
 
 
 def db_meta_cache_get(key):
     with DB_META_CACHE_LOCK:
-        return DB_META_CACHE.get(key)
+        cached = DB_META_CACHE.get(key)
+        if cached is not None:
+            return cached
+    return redis_cache_get("meta", key)
 
 
 def db_meta_cache_set(key, value):
@@ -3548,6 +3642,7 @@ def db_meta_cache_set(key, value):
         if len(DB_META_CACHE) > 64:
             for old_key in list(DB_META_CACHE.keys())[: len(DB_META_CACHE) - 64]:
                 DB_META_CACHE.pop(old_key, None)
+    redis_cache_set("meta", key, value, DB_META_CACHE_TTL)
 
 
 def normalize_submitted_origin(value):
