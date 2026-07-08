@@ -45,6 +45,7 @@ const DEFAULT_PAGE_SIZES = {
   announcements: 30,
   news: PAGE_SIZE,
   chat: PAGE_SIZE,
+  tools: PAGE_SIZE,
   status: PAGE_SIZE,
   about: PAGE_SIZE,
   detect: PAGE_SIZE,
@@ -74,6 +75,30 @@ const MODEL_SORT_HINTS = {
   cny: ["以人民币计价的站点，实际结算以各站点支付比率为准。", MODEL_SOURCE_NOTE],
   request: ["按次计费的站点（每次调用的价格），实际以各站点为准。", MODEL_SOURCE_NOTE],
 };
+
+const PREFERRED_CHAT_MODEL = "gpt-5.5";
+const PREFERRED_MODEL_PATTERNS = [
+  /^gpt-5\.5$/i,
+  /gpt[-_.\s]*5\.5/i,
+  /^gpt-5/i,
+  /gpt[-_.\s]*5/i,
+  /claude.*opus/i,
+  /claude.*sonnet/i,
+  /gemini.*pro/i,
+  /deepseek.*r1/i,
+  /deepseek.*v3/i,
+  /gpt[-_.\s]*4\.?1/i,
+  /gpt[-_.\s]*4o/i,
+];
+
+function preferredModelFromList(models = [], fallback = PREFERRED_CHAT_MODEL) {
+  const list = (models || []).filter(Boolean);
+  for (const pattern of PREFERRED_MODEL_PATTERNS) {
+    const matched = list.find((item) => pattern.test(item));
+    if (matched) return matched;
+  }
+  return list[0] || fallback;
+}
 
 function activeSiteSort(sort) {
   return SITE_SORTS.has(sort) ? sort : "random";
@@ -555,7 +580,7 @@ function App() {
     const requestId = requestSeq.current + 1;
     requestSeq.current = requestId;
     dataRequestController.current?.abort();
-    if (view === "about" || view === "detect" || view === "status" || view === "news" || view === "chat") {
+    if (view === "about" || view === "detect" || view === "status" || view === "news" || view === "chat" || view === "tools") {
       setLoading(false);
       setData({ items: [{ id: view }], total: 0, pages: 1, page: 1, page_size: currentPageSize });
       return;
@@ -645,8 +670,8 @@ function App() {
     <div className="app">
       <Topbar query={query} setQuery={setQuery} view={view} setView={setView} onSubmitSiteClick={jumpToSubmitSite} onRefresh={refreshVisibleData} loading={loading} />
       <Overview summary={summary} officialStatus={officialStatus} openOfficialStatus={openOfficialStatus} />
-      <main className={`shell ${view === "chat" ? "chat-shell" : ""}`}>
-        {view !== "chat" && (
+      <main className={`shell ${["chat", "tools"].includes(view) ? "chat-shell" : ""}`}>
+        {!["chat", "tools"].includes(view) && (
           <Sidebar
             view={view}
             filters={filters}
@@ -659,11 +684,11 @@ function App() {
           />
         )}
         <section className="main">
-          {view !== "news" && view !== "chat" && (
+          {view !== "news" && view !== "chat" && view !== "tools" && (
             <Toolbar view={view} layout={layout} setLayout={setLayout} data={data} loading={loading} sortHint={view === "models" ? MODEL_SORT_HINTS[activeModelSort(filters.sort)] : null} />
           )}
           <Content view={view} layout={layout} data={data} loading={loading} openSite={openSite} openPriceDrawer={setPriceDrawer} modelSort={activeModelSort(filters.sort)} filters={activeFilters} summary={summary} officialStatus={officialStatus} aiNews={aiNews} newsQuery={debouncedQuery} reloadAiNews={() => api("/api/ai-news", { force: 1 }).then(setAiNews)} aiNewsCategory={aiNewsCategory} setAiNewsCategory={setAiNewsCategory} officialProviderId={officialProviderId} setOfficialProviderId={setOfficialProviderId} reloadOfficialStatus={() => api("/api/official-status", { force: 1 }).then(setOfficialStatus)} />
-          {view !== "about" && view !== "detect" && view !== "status" && view !== "news" && view !== "chat" && (
+          {view !== "about" && view !== "detect" && view !== "status" && view !== "news" && view !== "chat" && view !== "tools" && (
             <Pager
               page={data.page || page}
               pages={data.pages || 1}
@@ -701,8 +726,7 @@ function SiteFooter({ setView }) {
       links: [
         ["站点聚合", () => go("sites")],
         ["模型比价", () => go("models")],
-        ["模型检测", () => go("detect")],
-        ["在线对话", () => go("chat")],
+        ["站点工具", () => go("tools")],
         ["官方状态", () => go("status")],
         ["AI 资讯", () => go("news")],
         ["公告流", () => go("announcements")],
@@ -788,8 +812,7 @@ function Topbar({ query, setQuery, view, setView, onSubmitSiteClick, onRefresh, 
       <nav className="view-tabs">
         <NavButton active={view === "sites"} onClick={() => setView("sites")} icon={Server}>站点聚合</NavButton>
         <NavButton active={view === "models"} onClick={() => setView("models")} icon={Sparkles}>模型比价</NavButton>
-        <NavButton active={view === "detect"} onClick={() => setView("detect")} icon={TestTubeDiagonal}>模型检测</NavButton>
-        <NavButton active={view === "chat"} onClick={() => setView("chat")} icon={MessageSquare}>在线对话</NavButton>
+        <NavButton active={["tools", "detect", "chat"].includes(view)} onClick={() => setView("tools")} icon={SlidersHorizontal}>站点工具</NavButton>
         <NavButton active={view === "announcements"} onClick={() => setView("announcements")} icon={Bell}>公告流</NavButton>
         <NavButton active={view === "news"} onClick={() => setView("news")} icon={Newspaper}>AI 资讯</NavButton>
         <NavButton active={view === "about"} onClick={() => setView("about")} icon={Info}>关于本站</NavButton>
@@ -1213,9 +1236,10 @@ function Toolbar({ view, layout, setLayout, data, loading, sortHint }) {
 
 function Content({ view, layout, data, loading, openSite, openPriceDrawer, modelSort, filters, summary, officialStatus, aiNews, newsQuery, reloadAiNews, aiNewsCategory, setAiNewsCategory, officialProviderId, setOfficialProviderId, reloadOfficialStatus }) {
   if (view === "about") return <AboutPage summary={summary} />;
-  if (view === "detect") return <DetectionPage />;
+  if (view === "tools") return <ToolsPage />;
+  if (view === "detect") return <ToolsPage initialTool="detect" />;
   if (view === "status") return <OfficialStatusPage status={officialStatus} selectedProviderId={officialProviderId} setSelectedProviderId={setOfficialProviderId} reload={reloadOfficialStatus} />;
-  if (view === "chat") return <ChatPage />;
+  if (view === "chat") return <ToolsPage initialTool="chat" />;
   if (view === "news") return <AiNewsPage news={aiNews} query={newsQuery} reload={reloadAiNews} category={aiNewsCategory} setCategory={setAiNewsCategory} />;
   const hasItems = Boolean(data.items?.length);
   if (loading && !hasItems) return <div className="empty"><Loader2 className="spin" size={22} />加载中，稍慢时会自动超时提示</div>;
@@ -1230,6 +1254,35 @@ function Content({ view, layout, data, loading, openSite, openPriceDrawer, model
 }
 
 const CHAT_SETTINGS_KEY = "relaywatch-chat-settings";
+
+function ToolsPage({ initialTool = "detect" }) {
+  const [activeTool, setActiveTool] = useState(initialTool);
+  useEffect(() => {
+    setActiveTool(initialTool);
+  }, [initialTool]);
+  return (
+    <section className="tools-page">
+      <div className="tools-head">
+        <div>
+          <span className="eyebrow">Site Tools</span>
+          <h2>站点工具</h2>
+          <p>把在线对话和模型检测放到同一个工作台里，先试接口，再做检测。</p>
+        </div>
+        <div className="tools-tabs" aria-label="站点工具切换">
+          <button type="button" className={activeTool === "chat" ? "active" : ""} onClick={() => setActiveTool("chat")}>
+            <MessageSquare size={16} />
+            在线对话
+          </button>
+          <button type="button" className={activeTool === "detect" ? "active" : ""} onClick={() => setActiveTool("detect")}>
+            <TestTubeDiagonal size={16} />
+            模型检测
+          </button>
+        </div>
+      </div>
+      {activeTool === "chat" ? <ChatPage /> : <DetectionPage />}
+    </section>
+  );
+}
 
 function readChatSettings() {
   try {
@@ -1300,7 +1353,7 @@ function ChatPage() {
   const saved = useMemo(readChatSettings, []);
   const [baseUrl, setBaseUrl] = useState(saved.baseUrl || "");
   const [apiKey, setApiKey] = useState(saved.apiKey || "");
-  const [model, setModel] = useState(saved.model || "gpt-4o-mini");
+  const [model, setModel] = useState(saved.model || PREFERRED_CHAT_MODEL);
   const [temperature, setTemperature] = useState(saved.temperature || "0.7");
   const [maxTokens, setMaxTokens] = useState(saved.maxTokens || "2048");
   const [models, setModels] = useState(saved.models || []);
@@ -1359,7 +1412,7 @@ function ChatPage() {
       const result = await postApi("/api/chat/models", { base_url: baseUrl, api_key: apiKey });
       const nextModels = result.items || [];
       setModels(nextModels);
-      if (nextModels.length && (!model || !nextModels.includes(model))) setModel(nextModels[0]);
+      if (nextModels.length && (!model || !nextModels.includes(model))) setModel(preferredModelFromList(nextModels));
       setStatus(nextModels.length ? `已获取 ${nextModels.length} 个模型` : "没有获取到模型");
     } catch (error) {
       setStatus(messageFromUnknown(error, "模型获取失败"));
@@ -1497,7 +1550,7 @@ function ChatPage() {
             <h3>对话窗口</h3>
             <span>{status || "等待输入"}</span>
           </div>
-          <span>{model || "未选择模型"}</span>
+          <span>{model || PREFERRED_CHAT_MODEL}</span>
         </div>
         <div className="chat-messages" ref={messagesRef} onScroll={handleChatScroll}>
           {messages.map((message) => (
@@ -3066,8 +3119,7 @@ function DetectionPage() {
       setDetectionModels(nextModels);
       if (nextModels.length) {
         if (!model || !nextModels.includes(model)) {
-          const preferred = nextModels.find((item) => /claude|gpt|gemini|deepseek/i.test(item)) || nextModels[0];
-          setModel(preferred);
+          setModel(preferredModelFromList(nextModels, ""));
         }
         setModelFetchStatus(`已获取 ${nextModels.length} 个模型`);
       } else {
