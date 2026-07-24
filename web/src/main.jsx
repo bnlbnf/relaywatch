@@ -842,10 +842,10 @@ function Overview({ summary, officialStatus, openOfficialStatus }) {
   return (
     <>
       <section className="overview">
-        <Metric icon={Globe2} label="站点总数" value={summary?.sites ?? "-"} />
-        <Metric icon={CheckCircle2} label="在线站点" value={summary?.online_sites ?? "-"} tone="good" />
-        <Metric icon={Sparkles} label="可比价模型" value={summary?.models ?? "-"} />
-        <Metric icon={Bell} label="公告记录" value={summary?.announcements ?? "-"} tone="warm" />
+        <Metric icon={CheckCircle2} label="????" value={summary?.online_sites ?? "-"} tone="good" />
+        <Metric icon={Sparkles} label="?????" value={summary?.models ?? "-"} />
+        <Metric icon={Database} label="????" value={summary?.card_shops ?? "-"} />
+        <Metric icon={Bell} label="????" value={summary?.announcements ?? "-"} tone="warm" />
       </section>
       <OfficialStatusStrip status={officialStatus} onOpen={openOfficialStatus} />
       <RainyunAd />

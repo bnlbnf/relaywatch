@@ -7260,7 +7260,7 @@ def db_summary():
     with db_connect() as conn:
         with conn.cursor() as cur:
             generation_id, data_version = db_active_state(cur)
-            cache_key = ("summary", generation_id, data_version)
+            cache_key = ("summary-v2-card-shops", generation_id, data_version)
             cached = db_meta_cache_get(cache_key)
             if cached is not None:
                 return cached
@@ -7270,6 +7270,7 @@ def db_summary():
                   (SELECT count(*) FROM sites WHERE generation_id = %s) AS sites,
                   (SELECT count(*) FROM sites WHERE generation_id = %s AND status = 'online') AS online_sites,
                   (SELECT count(*) FROM canonical_models WHERE generation_id = %s) AS models,
+                  (SELECT count(*) FROM card_shops) AS card_shops,
                   (SELECT count(*) FROM announcements) AS announcements
                 """,
                 (generation_id, generation_id, generation_id),
@@ -7282,6 +7283,7 @@ def db_summary():
         "sites": row["sites"],
         "online_sites": row["online_sites"],
         "models": row["models"],
+        "card_shops": row["card_shops"],
         "announcements": row["announcements"],
     }
     db_meta_cache_set(cache_key, result)
